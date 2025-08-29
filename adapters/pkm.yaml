@@ -3,17 +3,14 @@ app: pkm
 table: logs_pkm
 
 source:
-  kind: excel
-  file_glob: "data/pkm/*.csv"     # change or override via CLI
-  sheet: "Sheet1"
-  # The Excel has ONE text column; each cell is a pipe-delimited row.
-  # Its header cell is literally the string below:
-  line_column_header: "User ID|ID|Subsequence ID|Message|Audit Time (UTC)|Action|Type|Label|Version"
+  kind: csv
+  file_glob: "data/pkm/*.csv"     # pick up your local CSVs; CLI can override
 
 parse:
   delimiter: "|"
   quotechar: '"'
-  fields:               # exact order in each pipe-delimited row
+  # exact order in each pipe-delimited row (when CSV has a single text column)
+  fields:
     - user              # e.g., "(system)" or "Name Surname (login)"
     - id
     - subseq_id
@@ -21,15 +18,15 @@ parse:
     - audit_utc         # UTC timestamp string
     - action
     - type
-    - label             # product-like token (e.g., BS-CD20_RO7121932-000-006)
+    - label             # e.g., BS-CD20_RO7121932-000-006
     - version
 
 actors:
   system_token: "(system)"
-  login_regex: "\\((?P<login>[^)]+)\\)"          # captures login inside (...)
-  display_regex: "^(?P<name>[^()|]+)"            # leading name before '('
+  login_regex: "\\((?P<login>[^)]+)\\)"      # captures login inside (...)
+  display_regex: "^(?P<name>[^()|]+)"        # leading name before '('
 
-target_schema:          # DuckDB table schema
+target_schema:
   ts: TIMESTAMP
   actor: TEXT
   actor_display: TEXT
@@ -41,7 +38,7 @@ target_schema:          # DuckDB table schema
   version: TEXT
   message: TEXT
 
-mappings:               # logical mappings from parsed fields → target columns
+mappings:
   ts: audit_utc
   actor: "login_or_system"        # derived: login if present, else system token or display name
   actor_display: "display_name"   # derived from user
@@ -54,9 +51,9 @@ mappings:               # logical mappings from parsed fields → target columns
   version: version
 
 constraints:
-  require_fields: ["message"]     # fail-fast if message missing
-  drop_empty_ts: false            # keep rows even if ts missing (you can filter in SQL)
+  require_fields: ["message"]      # fail fast if message is missing
+  drop_empty_ts: false             # keep rows even if ts missing (filter later in SQL)
 
-indexes:                          # kept for parity; DuckDB will pushdown anyway
+indexes:
   - ["ts"]
   - ["actor","product","ts"]

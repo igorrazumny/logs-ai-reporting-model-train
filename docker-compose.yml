@@ -1,34 +1,38 @@
-version: "3.9"
+# File: docker-compose.yml
+
 services:
-  trainer:
-    image: logs-train:cuda
+  # Local LLM (single 8B model) — used by planner/presenter.
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama:/root/.ollama
+
+  app:
     build:
       context: .
       args:
-        BASE: "cuda"     # change to "cpu" for a CPU-only image
-    command: scripts.train_lora
+        BASE: "cpu"          # set to "cuda" if you add a CUDA base later
+    image: logs-train:cpu
+    container_name: logs-train
     environment:
       - PYTHONUNBUFFERED=1
+      - LLM_HOST=http://ollama:11434
+      - LLM_MODEL=llama3.1-8b-instruct-q4_K_M
     volumes:
-      - ./data:/app/data        # anonymized inputs (gitignored)
-      - ./models:/app/models    # adapters/checkpoints (gitignored)
-      - ./outputs:/app/outputs  # logs/reports (gitignored)
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - capabilities: [gpu]  # enable NVIDIA on compose v3 with Docker Engine + nvidia-container-toolkit
-    # For older Docker versions, run: docker compose run --gpus all trainer
+      - ./src:/app/src            # live-mount code for fast dev, no rebuilds
+      - ./data:/app/data          # local CSVs (gitignored)
+      - ./outputs:/app/outputs    # DuckDB, logs (gitignored)
+      - ./adapters:/app/adapters  # YAML adapters
+      - ./docs:/app/docs          # optional, if UI links docs
+    depends_on:
+      - ollama
+    # We invoke modules explicitly via `make` (overrides entrypoint/cmd):
+    #   make load CSV="data/pkm/2020-04 Source Logs.csv"
+    #   make ui
 
-  anonymize:
-    image: logs-train:cpu
-    build:
-      context: .
-      args:
-        BASE: "cpu"
-    command: scripts.anonymize_logs
-    environment:
-      - LOGS_EXPORT_SALT=${LOGS_EXPORT_SALT:?set_this_first}
-    volumes:
-      - ./data:/app/data
-      - ./outputs:/app/outputs
+volumes:
+  ollama:
