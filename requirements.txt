@@ -1,0 +1,14 @@
+# core
+pandas==2.2.2
+pyarrow==17.0.0
+python-dateutil==2.9.0.post0
+
+# training (add more later)
+transformers==4.43.3
+accelerate==0.33.0
+peft==0.12.0
+bitsandbytes==0.43.3 ; platform_system != "Darwin"
+duckdb==1.1.2
+
+# misc
+tqdm==4.66.4

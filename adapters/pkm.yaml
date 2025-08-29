@@ -1,0 +1,62 @@
+# File: adapters/pkm.yaml
+app: pkm
+table: logs_pkm
+
+source:
+  kind: excel
+  file_glob: "data/pkm/*.csv"     # change or override via CLI
+  sheet: "Sheet1"
+  # The Excel has ONE text column; each cell is a pipe-delimited row.
+  # Its header cell is literally the string below:
+  line_column_header: "User ID|ID|Subsequence ID|Message|Audit Time (UTC)|Action|Type|Label|Version"
+
+parse:
+  delimiter: "|"
+  quotechar: '"'
+  fields:               # exact order in each pipe-delimited row
+    - user              # e.g., "(system)" or "Name Surname (login)"
+    - id
+    - subseq_id
+    - message
+    - audit_utc         # UTC timestamp string
+    - action
+    - type
+    - label             # product-like token (e.g., BS-CD20_RO7121932-000-006)
+    - version
+
+actors:
+  system_token: "(system)"
+  login_regex: "\\((?P<login>[^)]+)\\)"          # captures login inside (...)
+  display_regex: "^(?P<name>[^()|]+)"            # leading name before '('
+
+target_schema:          # DuckDB table schema
+  ts: TIMESTAMP
+  actor: TEXT
+  actor_display: TEXT
+  product: TEXT
+  action: TEXT
+  type: TEXT
+  id: TEXT
+  subseq_id: TEXT
+  version: TEXT
+  message: TEXT
+
+mappings:               # logical mappings from parsed fields → target columns
+  ts: audit_utc
+  actor: "login_or_system"        # derived: login if present, else system token or display name
+  actor_display: "display_name"   # derived from user
+  product: label
+  message: message
+  action: action
+  type: type
+  id: id
+  subseq_id: subseq_id
+  version: version
+
+constraints:
+  require_fields: ["message"]     # fail-fast if message missing
+  drop_empty_ts: false            # keep rows even if ts missing (you can filter in SQL)
+
+indexes:                          # kept for parity; DuckDB will pushdown anyway
+  - ["ts"]
+  - ["actor","product","ts"]

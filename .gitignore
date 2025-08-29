@@ -32,3 +32,10 @@ artifacts/
 # IDE
 .idea/
 .vscode/
+
+# Local data and outputs
+data/
+outputs/
+*.csv
+*.parquet
+*.duckdb

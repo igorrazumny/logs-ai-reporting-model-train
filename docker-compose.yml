@@ -1,0 +1,34 @@
+version: "3.9"
+services:
+  trainer:
+    image: logs-train:cuda
+    build:
+      context: .
+      args:
+        BASE: "cuda"     # change to "cpu" for a CPU-only image
+    command: scripts.train_lora
+    environment:
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./data:/app/data        # anonymized inputs (gitignored)
+      - ./models:/app/models    # adapters/checkpoints (gitignored)
+      - ./outputs:/app/outputs  # logs/reports (gitignored)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]  # enable NVIDIA on compose v3 with Docker Engine + nvidia-container-toolkit
+    # For older Docker versions, run: docker compose run --gpus all trainer
+
+  anonymize:
+    image: logs-train:cpu
+    build:
+      context: .
+      args:
+        BASE: "cpu"
+    command: scripts.anonymize_logs
+    environment:
+      - LOGS_EXPORT_SALT=${LOGS_EXPORT_SALT:?set_this_first}
+    volumes:
+      - ./data:/app/data
+      - ./outputs:/app/outputs

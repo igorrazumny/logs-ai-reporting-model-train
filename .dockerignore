@@ -1,0 +1,18 @@
+# Keep images small
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+
+# Big / private stuff
+data/
+models/
+outputs/
+*.parquet
+*.jsonl
+*.csv
+
+# IDE
+.idea/
+.vscode/
