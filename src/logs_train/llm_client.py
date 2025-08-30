@@ -4,17 +4,29 @@ import json
 import time
 import requests
 from typing import Optional, Tuple
+
 from logs_train.prompts import PKM_SINGLE_JSON_PROMPT as _SYS_PROMPT
 
-OLLAMA_HOST   = os.getenv("LLM_HOST", "http://ollama:11434")
-LLM_MODEL     = os.getenv("LLM_MODEL", "llama3.2:1b-instruct-q4_K_M")
-LLM_TIMEOUT_S = int(os.getenv("LLM_TIMEOUT_S", "60"))
+
+def _get_env_or_fail(key: str) -> str:
+    val = os.getenv(key)
+    if not val:
+        raise RuntimeError(f"[env] missing required environment variable: {key}")
+    return val
+
+
+# Strict: no silent fallbacks
+OLLAMA_HOST   = _get_env_or_fail("LOG_LLM_HOST")
+LLM_MODEL     = _get_env_or_fail("LOG_LLM_MODEL")
+LLM_TIMEOUT_S = int(os.getenv("LLM_TIMEOUT_S", "60"))  # this one can be optional
+
 
 def _truncate(s: str, n: int = 240) -> str:
     return s if len(s) <= n else s[:n] + "…"
 
+
 def _clean_llm_output(txt: str) -> str:
-    # still keep a light cleaner in case the model ignores format=json
+    # Light cleaner in case a model ignores format=json (rare).
     clean = txt.strip()
     if clean.startswith("```"):
         parts = clean.split("```")
@@ -22,6 +34,7 @@ def _clean_llm_output(txt: str) -> str:
         clean = max(candidates, key=len) if candidates else clean
     clean = clean.lstrip().lstrip("json").lstrip()
     return clean
+
 
 def call_llm_single(record: str, timeout_s: int = LLM_TIMEOUT_S) -> Tuple[Optional[dict], str]:
     prompt = f"{_SYS_PROMPT}\nLOG RECORD:\n{record}"
@@ -34,32 +47,28 @@ def call_llm_single(record: str, timeout_s: int = LLM_TIMEOUT_S) -> Tuple[Option
                 "model": LLM_MODEL,
                 "prompt": prompt,
                 "stream": False,
-                # 👇 this is the key change: ask Ollama to return strict JSON
-                "format": "json",
+                "format": "json",       # ask Ollama to constrain to JSON
                 "options": {
                     "temperature": 0.0,
-                    # optional: reduce rambling; adjust if you see truncation
                     "num_predict": 256
                 },
             },
             timeout=timeout_s,
         )
         r.raise_for_status()
-        # with format=json, content-type is JSON and 'response' should be a JSON object string
         payload = r.json() or {}
         txt = (payload.get("response", "") or "").strip()
         print(f"[llm] ← received at {time.strftime('%H:%M:%S')} (len={len(txt)})")
         print(f"[llm] RAW: {_truncate(txt)}")
 
-        # if the server already returned a parsed JSON object, some builds put it under 'format'/'json'
+        # Some builds return parsed JSON under payload["format"]["json"]
         if isinstance(payload.get("format"), dict) and "json" in payload.get("format", {}):
             return payload["format"]["json"], txt
 
-        # otherwise parse the string we received (should be strict JSON due to format=json)
+        # Otherwise parse the string (should be strict JSON due to format=json)
         try:
             return json.loads(txt), txt
         except Exception:
-            # extremely rare: fall back to light cleaner and retry
             clean = _clean_llm_output(txt)
             s, e = clean.find("{"), clean.rfind("}")
             if s != -1 and e != -1:

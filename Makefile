@@ -74,23 +74,27 @@ first-run: build up llm-pull-3b
 	@echo "  make ui"
 
 # ========== Cold start (reset DB + limited run; model comes from .env) ==========
-# Usage: make cold CSV="data/pkm/2020-04 Source Logs.csv" [N=20]
+# Usage: make cold CSV="data/pkm/2020-04 Source Logs.csv" [N=<count>]
 # - Ensures outputs/ dir exists
 # - Removes DuckDB file
 # - Restarts containers (applies .env changes)
-# - Loads using LOG_LLM_MODEL from .env with MAX_RECORDS=N (default 20)
-N ?= 20
+# - Loads using LOG_LLM_MODEL from .env with MAX_RECORDS=N; if N is not set -> MAX_RECORDS=0 (take all)
 .PHONY: cold
 cold:
 	test -n "$(CSV)" || (echo "Set CSV=<path> e.g. CSV='data/pkm/2020-04 Source Logs.csv'"; exit 2)
 	$(MAKE) init
 	rm -f outputs/pkm.duckdb
 	$(MAKE) restart
-	MAX_RECORDS=$(N) $(MAKE) load CSV="$(CSV)"
+	@if [ -n "$(N)" ]; then \
+		MAX_RECORDS="$(N)"; \
+	else \
+		MAX_RECORDS=0; \
+	fi; \
+	MAX_RECORDS="$$MAX_RECORDS" $(MAKE) load CSV="$(CSV)"
 
 # ========== DB preview ==========
 .PHONY: show
 DB ?= outputs/pkm.duckdb
-LIMIT ?= 20
+LIMIT ?= 0   # 0 = all rows
 show:
 	docker compose run --rm app python -m src.logs_train.show_db $(DB) $(LIMIT)

@@ -1,11 +1,10 @@
 # File: src/logs_train/load.py
 import os
-import re
 import time
 import requests
 import duckdb
 import yaml
-from typing import Tuple, List
+from typing import List
 
 from logs_train.record_iter import iter_records
 from logs_train.llm_client import call_llm_single as _call_llm
@@ -13,7 +12,6 @@ from logs_train.llm_client import call_llm_single as _call_llm
 # ======== Basic config ========
 OLLAMA_HOST   = os.getenv("LOG_LLM_HOST")
 LLM_MODEL     = os.getenv("LOG_LLM_MODEL")
-CSV_HEADER    = "User ID|ID|Subsequence ID|Message|Audit Time (UTC)|Action|Type|Label|Version"
 REJECTS_PATH  = "outputs/pkm_rejects.log"
 
 LLM_TIMEOUT_S = int(os.getenv("LLM_TIMEOUT_S", "60"))
@@ -24,22 +22,10 @@ def _read_yaml(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-def _derive_actor(user: str, system_token: str, login_re: str, display_re: str) -> Tuple[str, str | None]:
-    if not user:
-        return None, None
-    user = user.strip()
-    if user == system_token:
-        return system_token, None
-    m_login = re.search(login_re, user)
-    m_disp  = re.search(display_re, user)
-    login = m_login.group("login") if m_login else None
-    disp  = m_disp.group("name").strip() if m_disp else None
-    return login or disp or user, disp
-
 def _truncate(s: str, n: int = 240) -> str:
     return s if len(s) <= n else s[:n] + "…"
 
-# ======== Loader (LLM-only, message as raw string) ========
+# ======== Loader (driven 1:1 by YAML.fields) ========
 def load_pkm_from_csv(
     csv_path: str,
     yaml_path: str = "adapters/pkm.yaml",
@@ -52,14 +38,11 @@ def load_pkm_from_csv(
     print(f"[hc] Model  = {LLM_MODEL}")
 
     # --- Guarantee directories exist (host + container) BEFORE connecting ---
-    # Normalize db_path to absolute, then ensure its parent exists.
     db_path_abs = os.path.abspath(db_path)
     db_dir = os.path.dirname(db_path_abs) or "."
     os.makedirs(db_dir, exist_ok=True)
-    # Keep your rejects log directory too
     rej_dir = os.path.dirname(os.path.abspath(REJECTS_PATH)) or "."
     os.makedirs(rej_dir, exist_ok=True)
-    # Belt-and-suspenders: also ensure the typical container path
     os.makedirs("/app/outputs", exist_ok=True)
 
     # Healthcheck Ollama
@@ -68,7 +51,7 @@ def load_pkm_from_csv(
     except Exception as e:
         raise RuntimeError(f"[hc] cannot reach Ollama: {e}")
 
-    # Load YAML config (may be minimal)
+    # Load YAML config
     cfg = _read_yaml(yaml_path) or {}
 
     # Require explicit app name; no defaults
@@ -77,27 +60,22 @@ def load_pkm_from_csv(
     app_name = str(cfg["app"]).strip()
     table = f"logs_{app_name}"
 
-    # Merge defaults for actors if not present in YAML
-    DEFAULT_ACTORS = {
-        "system_token": "(system)",
-        "login_regex": r"\((?P<login>[^)]+)\)",
-        "display_regex": r"^(?P<name>[^()|]+)"
-    }
-    actors_cfg = {**DEFAULT_ACTORS, **cfg.get("actors", {})}
+    # Fields drive everything 1:1 from YAML
+    SRC_FIELDS = cfg.get("fields") or []
+    if not SRC_FIELDS:
+        raise RuntimeError(f"[cfg] 'fields' is required in {yaml_path}")
 
-    # optional constraint; fine if constraints missing
+    # Optional constraint flag
     require_message = "message" in cfg.get("constraints", {}).get("require_fields", [])
 
     con = duckdb.connect(db_path_abs)
     try:
-        con.execute(
-            f"CREATE TABLE IF NOT EXISTS {table}("
-            "ts TIMESTAMP, actor TEXT, actor_display TEXT, product TEXT, action TEXT, "
-            "type TEXT, id TEXT, subseq_id TEXT, version TEXT, message TEXT)"
-        )
+        # Create table with columns exactly as in YAML.fields (all TEXT for raw landing)
+        cols_sql = ", ".join([f'"{c}" TEXT' for c in SRC_FIELDS])
+        con.execute(f'CREATE TABLE IF NOT EXISTS "{table}" ({cols_sql})')
         if truncate:
-            con.execute(f"DELETE FROM {table}")
-            print(f"[db] cleared {table}")
+            con.execute(f'DELETE FROM "{table}"')
+            print(f'[db] cleared {table}')
 
         total = accepted = rejected = 0
         rejected_lines: List[str] = []
@@ -111,54 +89,33 @@ def load_pkm_from_csv(
             print(f"\n[rec#{total}] RAW: {_truncate(rec)}")
 
             parsed, _ = _call_llm(rec)
-            # Expect plain message (no base64)
             if parsed is None or not isinstance(parsed, dict):
                 print(f"[rec#{total}] → REJECT (no/invalid JSON)")
                 rejected += 1
                 rejected_lines.append(rec)
                 continue
 
-            # Ensure all keys exist; fill unknown with ""
-            KEYS = ["user","id","subseq_id","message","audit_utc","action","type","label","version"]
-            data = {k: (parsed.get(k, "") if parsed.get(k, "") is not None else "") for k in KEYS}
+            # Ensure all YAML fields exist in the parsed output; fill missing with ""
+            data = {k: (parsed.get(k, "") if parsed.get(k, "") is not None else "") for k in SRC_FIELDS}
 
-            msg = (data["message"] or "").rstrip("\r")
-            if require_message and not msg.strip():
-                print(f"[rec#{total}] → REJECT (empty message)")
-                rejected += 1
-                rejected_lines.append(rec)
-                continue
+            # Optional: enforce non-empty message
+            if "message" in data:
+                msg_text = (data["message"] or "").rstrip("\r")
+                if require_message and not msg_text.strip():
+                    print(f"[rec#{total}] → REJECT (empty message)")
+                    rejected += 1
+                    rejected_lines.append(rec)
+                    continue
+                data["message"] = msg_text
 
-            # Normalize timestamp (bad values -> NULL)
-            ts_raw = data["audit_utc"] or None
-            ts_val = None
-            if ts_raw:
-                try:
-                    ts_val = con.execute("SELECT TRY_CAST(? AS TIMESTAMP)", [ts_raw]).fetchone()[0]
-                except Exception:
-                    ts_val = None
+            # Build row values in the exact YAML order
+            row_vals = [data[k] for k in SRC_FIELDS]
 
-            actor, disp = _derive_actor(
-                data["user"],
-                actors_cfg["system_token"],
-                actors_cfg["login_regex"],
-                actors_cfg["display_regex"],
-            )
-
-            vals = (
-                ts_val,
-                actor,
-                disp,
-                (data["label"] or None),
-                (data["action"] or None),
-                (data["type"] or None),
-                (data["id"] or None),
-                (data["subseq_id"] or None),
-                (data["version"] or None),
-                msg,
-            )
+            # Insert into the exact YAML fields
+            cols_quoted = ",".join([f'"{c}"' for c in SRC_FIELDS])
+            placeholders = ",".join(["?"] * len(row_vals))
+            con.execute(f'INSERT INTO "{table}" ({cols_quoted}) VALUES ({placeholders})', row_vals)
             print(f"[rec#{total}] JSON OK → DB INSERT")
-            con.execute(f"INSERT INTO {table} VALUES (?,?,?,?,?,?,?,?,?,?)", vals)
             accepted += 1
 
         ratio = (accepted / total) if total else 0.0

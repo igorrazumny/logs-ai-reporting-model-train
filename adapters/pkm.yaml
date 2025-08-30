@@ -1,3 +1,4 @@
+# adapters/pkm.yaml
 app: pkm
 fields: [user, id, subseq_id, message, audit_utc, action, type, label, version]
 delimiter: "|"
