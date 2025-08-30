@@ -39,3 +39,7 @@ outputs/
 *.csv
 *.parquet
 *.duckdb
+
+
+# Backups
+backups/

@@ -1,3 +1,24 @@
+# File: Makefile
+# Minimal, no-legacy Makefile for logs-ai-reporting-model-train
+
+# ========== Global config variables ==========
+# You can override any of these on the command line, e.g.:
+#   make ingest INBOX=data/inbox N=100
+DB_PATH       ?= outputs/pkm.duckdb
+DB            ?= $(DB_PATH)
+
+# Record limits
+N             ?= 20      # for cold runs (used to cap ingest); set N=0 to take all
+LIMIT         ?= 0       # for show/show-save (0 = all)
+
+# Ingest directories
+INBOX         ?= data/inbox
+PROCESSED     ?= data/processed
+FAILED        ?= data/failed
+
+# Adapter definition
+ADAPTER_YAML  ?= adapters/pkm.yaml
+
 # ========== Local (venv) quick setup — optional if you prefer pure Docker ==========
 .PHONY: venv deps
 venv:
@@ -8,7 +29,7 @@ deps: venv
 	python -m pip install -r requirements.txt
 
 # ========== Docker build/run ==========
-.PHONY: build up down restart bounce reup logs
+.PHONY: build up down restart logs
 build:
 	docker compose build
 
@@ -23,25 +44,11 @@ restart:
 	docker compose down
 	docker compose up -d
 
-# Convenience aliases
-bounce: restart
-reup: restart
-
 logs:
 	docker compose logs -f app
 
-# ========== LLM model management (Ollama) ==========
-.PHONY: llm-pull-8b llm-pull-3b llm-list
-llm-pull-8b:
-	# Pull the 8B model
-	docker compose up -d ollama
-	docker exec -it ollama ollama pull llama3.1:8b-instruct-q4_K_M
-
-llm-pull-3b:
-	# Pull the 3B model (recommended for development on CPU)
-	docker compose up -d ollama
-	docker exec -it ollama ollama pull llama3.2:3b-instruct-q4_K_M
-
+# ========== LLM utility (optional) ==========
+.PHONY: llm-list
 llm-list:
 	docker exec -it ollama ollama list
 
@@ -50,51 +57,82 @@ llm-list:
 init:
 	mkdir -p outputs
 	mkdir -p data
+	mkdir -p backups
+	mkdir -p $(INBOX) $(PROCESSED) $(FAILED)
 
-# ========== Loader (runs inside Docker) ==========
-# Usage: make load CSV="data/pkm/2020-04 Source Logs.csv"
+# ========== Bulk ingest from an inbox (preferred path) ==========
+.PHONY: ingest
+ingest: init
+	# Process CSVs from inbox, optionally capped by MAX_RECORDS=N
+	docker compose run --rm \
+		-e INBOX=$(INBOX) \
+		-e PROCESSED=$(PROCESSED) \
+		-e FAILED=$(FAILED) \
+		-e ADAPTER_YAML=$(ADAPTER_YAML) \
+		-e DB_PATH=$(DB_PATH) \
+		$(if $(N),-e MAX_RECORDS=$(N),) \
+		app python -m src.logs_train.ingest_dir
+
+# ========== Ad-hoc single-file load (keep for testing only) ==========
+# Usage: make load CSV="data/inbox/some.csv"
 .PHONY: load
 load: init
-	test -n "$(CSV)" || (echo "Set CSV=<path> e.g. CSV='data/pkm/2020-04 Source Logs.csv'"; exit 2)
-	# Guard inside the container too, so /app/outputs always exists even if the bind mount is empty/missing.
+	test -n "$(CSV)" || (echo "Set CSV=<path> e.g. CSV='data/inbox/2020-04 Source Logs Part 1.csv'"; exit 2)
 	docker compose run --rm -e MAX_RECORDS app sh -lc 'mkdir -p /app/outputs && python -m src.logs_train.cli load-pkm "$(CSV)"'
 
-# ========== Streamlit UI (inside Docker) ==========
-.PHONY: ui
-ui: init
-	# Exposes Streamlit on http://localhost:8501
-	docker compose run --rm -p 8501:8501 app python -m src.logs_train.ui_streamlit
+# ========== DB preview ==========
+.PHONY: show show-save
+show:
+	docker compose run --rm \
+		-e ADAPTER_YAML=$(ADAPTER_YAML) \
+		app python -m src.logs_train.show_db $(DB) $(LIMIT)
 
-# ========== First run convenience ==========
-.PHONY: first-run
-first-run: build up llm-pull-3b
-	@echo "Now load your CSV with:"
-	@echo "  make load CSV='data/pkm/2020-04 Source Logs.csv'"
-	@echo "Then run the UI with:"
-	@echo "  make ui"
+show-save:
+	@mkdir -p outputs/pkm
+	@ts=$$(date +%Y%m%d_%H%M%S_%3N); \
+	out="outputs/pkm/show_$${ts}_limit$(LIMIT).jsonl"; \
+	echo "[show-save] writing to $$out"; \
+	docker compose run --rm \
+		-e ADAPTER_YAML=$(ADAPTER_YAML) \
+		app python -m src.logs_train.show_db "$(DB)" "$(LIMIT)" > "$$out"; \
+	echo "[show-save] done: $$out"
 
-# ========== Cold start (reset DB + limited run; model comes from .env) ==========
-# Usage: make cold CSV="data/pkm/2020-04 Source Logs.csv" [N=<count>]
-# - Ensures outputs/ dir exists
+# ========== Truncate PKM table (manual clean; we do NOT drop the DB file) ==========
+.PHONY: truncate-pkm
+truncate-pkm: init
+	docker compose run --rm app duckdb $(DB_PATH) "DELETE FROM logs_pkm;"
+
+# ========== Backup DB ==========
+# Creates a timestamped copy AND updates backups/latest.duckdb
+.PHONY: backup-db
+backup-db: init
+	@ts=$$(date +%Y%m%d_%H%M%S); \
+	dst_ts="backups/pkm_$${ts}.duckdb"; \
+	echo "[backup-db] saving $(DB_PATH) -> $$dst_ts"; \
+	cp -f $(DB_PATH) $$dst_ts; \
+	echo "[backup-db] updating backups/latest.duckdb"; \
+	cp -f $$dst_ts backups/latest.duckdb; \
+	echo "[backup-db] done: $$dst_ts and backups/latest.duckdb"
+
+# ========== Restore DB from the latest backup ==========
+.PHONY: restore-db
+restore-db: init
+	@if [ ! -f backups/latest.duckdb ]; then \
+		echo "[restore-db] ERROR: backups/latest.duckdb not found. Run 'make backup-db' first."; exit 2; \
+	fi
+	@echo "[restore-db] restoring backups/latest.duckdb -> $(DB_PATH)"
+	@cp -f backups/latest.duckdb $(DB_PATH)
+	@echo "[restore-db] done."
+
+# ========== Cold start (reset DB and ingest from INBOX) ==========
+# Usage: make cold [N=<count>]
+# - Ensures dirs exist
 # - Removes DuckDB file
 # - Restarts containers (applies .env changes)
-# - Loads using LOG_LLM_MODEL from .env with MAX_RECORDS=N; if N is not set -> MAX_RECORDS=0 (take all)
+# - Runs ingest with MAX_RECORDS=N (0 or unset = take all)
 .PHONY: cold
 cold:
-	test -n "$(CSV)" || (echo "Set CSV=<path> e.g. CSV='data/pkm/2020-04 Source Logs.csv'"; exit 2)
 	$(MAKE) init
-	rm -f outputs/pkm.duckdb
+	rm -f $(DB_PATH)
 	$(MAKE) restart
-	@if [ -n "$(N)" ]; then \
-		MAX_RECORDS="$(N)"; \
-	else \
-		MAX_RECORDS=0; \
-	fi; \
-	MAX_RECORDS="$$MAX_RECORDS" $(MAKE) load CSV="$(CSV)"
-
-# ========== DB preview ==========
-.PHONY: show
-DB ?= outputs/pkm.duckdb
-LIMIT ?= 0   # 0 = all rows
-show:
-	docker compose run --rm app python -m src.logs_train.show_db $(DB) $(LIMIT)
+	$(MAKE) ingest N=$(N)

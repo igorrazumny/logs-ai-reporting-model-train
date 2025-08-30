@@ -1,6 +1,6 @@
 # Purpose: Read/print rows from DuckDB (JSON Lines), aligned with YAML fields.
 # - LIMIT=0 -> print ALL rows (no LIMIT clause)
-# - Uses adapters/pkm.yaml (or ADAPTER_YAML env) for: app + fields
+# - Uses adapters/pkm show-save DB files source data.yaml (or ADAPTER_YAML env) for: app + fields
 # - Table name: logs_{app}
 # - Prints a metadata line first, then each row as JSON
 
@@ -14,7 +14,7 @@ from typing import Any, Dict, List
 
 import yaml
 
-DEFAULT_ADAPTER_YAML = os.getenv("ADAPTER_YAML", "adapters/pkm.yaml")
+DEFAULT_ADAPTER_YAML = os.getenv("ADAPTER_YAML")
 
 def _coerce_jsonable(v: Any) -> Any:
     """Coerce DuckDB/Python types to JSON-serializable values."""
