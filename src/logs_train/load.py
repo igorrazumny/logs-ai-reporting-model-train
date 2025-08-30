@@ -11,13 +11,13 @@ from logs_train.record_iter import iter_records
 from logs_train.llm_client import call_llm_single as _call_llm
 
 # ======== Basic config ========
-OLLAMA_HOST   = os.getenv("LLM_HOST", "http://ollama:11434")
-LLM_MODEL     = os.getenv("LLM_MODEL", "llama3.2:1b-instruct-q4_K_M")
+OLLAMA_HOST   = os.getenv("LOG_LLM_HOST")
+LLM_MODEL     = os.getenv("LOG_LLM_MODEL")
 CSV_HEADER    = "User ID|ID|Subsequence ID|Message|Audit Time (UTC)|Action|Type|Label|Version"
 REJECTS_PATH  = "outputs/pkm_rejects.log"
 
 LLM_TIMEOUT_S = int(os.getenv("LLM_TIMEOUT_S", "60"))
-MAX_RECORDS   = int(os.getenv("MAX_RECORDS", "100"))  # 0 = unlimited
+MAX_RECORDS   = int(os.getenv("MAX_RECORDS", "0"))  # 0 = unlimited
 
 # ======== YAML / helpers ========
 def _read_yaml(path: str) -> dict:
@@ -68,20 +68,33 @@ def load_pkm_from_csv(
     except Exception as e:
         raise RuntimeError(f"[hc] cannot reach Ollama: {e}")
 
-    cfg = _read_yaml(yaml_path)
+    # Load YAML config (may be minimal)
+    cfg = _read_yaml(yaml_path) or {}
+
+    # Merge defaults for actors if not present in YAML
+    DEFAULT_ACTORS = {
+        "system_token": "(system)",
+        "login_regex": r"\((?P<login>[^)]+)\)",
+        "display_regex": r"^(?P<name>[^()|]+)"
+    }
+    actors_cfg = {**DEFAULT_ACTORS, **cfg.get("actors", {})}
+
+    # optional constraint; fine if constraints missing
     require_message = "message" in cfg.get("constraints", {}).get("require_fields", [])
 
-    # --- Connect using the absolute db path we just ensured ---
+    # derive table name from 'app' (fallback 'pkm')
+    table = f"logs_{cfg.get('app', 'pkm')}"
+
     con = duckdb.connect(db_path_abs)
     try:
         con.execute(
-            "CREATE TABLE IF NOT EXISTS logs_pkm("
+            f"CREATE TABLE IF NOT EXISTS {table}("
             "ts TIMESTAMP, actor TEXT, actor_display TEXT, product TEXT, action TEXT, "
             "type TEXT, id TEXT, subseq_id TEXT, version TEXT, message TEXT)"
         )
         if truncate:
-            con.execute("DELETE FROM logs_pkm")
-            print("[db] cleared logs_pkm")
+            con.execute(f"DELETE FROM {table}")
+            print(f"[db] cleared {table}")
 
         total = accepted = rejected = 0
         rejected_lines: List[str] = []
@@ -124,9 +137,9 @@ def load_pkm_from_csv(
 
             actor, disp = _derive_actor(
                 data["user"],
-                cfg["actors"]["system_token"],
-                cfg["actors"]["login_regex"],
-                cfg["actors"]["display_regex"],
+                actors_cfg["system_token"],
+                actors_cfg["login_regex"],
+                actors_cfg["display_regex"],
             )
 
             vals = (
@@ -142,7 +155,7 @@ def load_pkm_from_csv(
                 msg,
             )
             print(f"[rec#{total}] JSON OK → DB INSERT")
-            con.execute("INSERT INTO logs_pkm VALUES (?,?,?,?,?,?,?,?,?,?)", vals)
+            con.execute(f"INSERT INTO {table} VALUES (?,?,?,?,?,?,?,?,?,?)", vals)
             accepted += 1
 
         ratio = (accepted / total) if total else 0.0

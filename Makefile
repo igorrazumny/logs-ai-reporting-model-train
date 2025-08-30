@@ -1,5 +1,3 @@
-# File: Makefile
-
 # ========== Local (venv) quick setup — optional if you prefer pure Docker ==========
 .PHONY: venv deps
 venv:
@@ -10,7 +8,7 @@ deps: venv
 	python -m pip install -r requirements.txt
 
 # ========== Docker build/run ==========
-.PHONY: build up down logs
+.PHONY: build up down restart bounce reup logs
 build:
 	docker compose build
 
@@ -19,6 +17,15 @@ up:
 
 down:
 	docker compose down
+
+# Restart the stack (applies changes in .env and docker-compose.yml)
+restart:
+	docker compose down
+	docker compose up -d
+
+# Convenience aliases
+bounce: restart
+reup: restart
 
 logs:
 	docker compose logs -f app
@@ -50,7 +57,7 @@ init:
 load: init
 	test -n "$(CSV)" || (echo "Set CSV=<path> e.g. CSV='data/pkm/2020-04 Source Logs.csv'"; exit 2)
 	# Guard inside the container too, so /app/outputs always exists even if the bind mount is empty/missing.
-	docker compose run --rm app sh -lc 'mkdir -p /app/outputs && python -m src.logs_train.cli load-pkm "$(CSV)"'
+	docker compose run --rm -e MAX_RECORDS app sh -lc 'mkdir -p /app/outputs && python -m src.logs_train.cli load-pkm "$(CSV)"'
 
 # ========== Streamlit UI (inside Docker) ==========
 .PHONY: ui
@@ -68,17 +75,22 @@ first-run: build up llm-pull-3b
 
 # ========== Cold start (reset DB + limited run; model comes from .env) ==========
 # Usage: make cold CSV="data/pkm/2020-04 Source Logs.csv" [N=20]
-# - Shuts down containers
 # - Ensures outputs/ dir exists
 # - Removes DuckDB file
-# - Starts containers
+# - Restarts containers (applies .env changes)
 # - Loads using LOG_LLM_MODEL from .env with MAX_RECORDS=N (default 20)
 N ?= 20
 .PHONY: cold
 cold:
 	test -n "$(CSV)" || (echo "Set CSV=<path> e.g. CSV='data/pkm/2020-04 Source Logs.csv'"; exit 2)
-	$(MAKE) down
 	$(MAKE) init
 	rm -f outputs/pkm.duckdb
-	$(MAKE) up
+	$(MAKE) restart
 	MAX_RECORDS=$(N) $(MAKE) load CSV="$(CSV)"
+
+# ========== DB preview ==========
+.PHONY: show
+DB ?= outputs/pkm.duckdb
+LIMIT ?= 20
+show:
+	docker compose run --rm app python -m src.logs_train.show_db $(DB) $(LIMIT)

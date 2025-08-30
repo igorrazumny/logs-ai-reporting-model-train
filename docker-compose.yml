@@ -1,5 +1,3 @@
-# File: docker-compose.yml
-
 services:
   ollama:
     image: ollama/ollama:latest
@@ -17,11 +15,20 @@ services:
         BASE: "cpu"
     image: logs-train:cpu
     container_name: logs-train
+    restart: unless-stopped
+    env_file: .env
     environment:
       - PYTHONUNBUFFERED=1
-      - LLM_HOST=http://ollama:11434
-      - LOG_LLM_MODEL=${LOG_LLM_MODEL}   # must be set, no default
-      - SQL_LLM_MODEL=${SQL_LLM_MODEL}   # must be set, no default
+
+      # Log ingestion LLM (host+model from .env)
+      - LOG_LLM_HOST=${LOG_LLM_HOST}
+      - LOG_LLM_MODEL=${LOG_LLM_MODEL}
+
+      # NL→SQL LLM (host+model from .env; future use)
+      - SQL_LLM_HOST=${SQL_LLM_HOST}
+      - SQL_LLM_MODEL=${SQL_LLM_MODEL}
+
+      # Loader tuning
       - LOAD_VERBOSE=1
       - LOAD_TICK_SEC=1
       - LOAD_PROGRESS_EVERY=500
