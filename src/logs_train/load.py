@@ -71,6 +71,12 @@ def load_pkm_from_csv(
     # Load YAML config (may be minimal)
     cfg = _read_yaml(yaml_path) or {}
 
+    # Require explicit app name; no defaults
+    if "app" not in cfg or not str(cfg["app"]).strip():
+        raise RuntimeError(f"[cfg] missing required 'app' in {yaml_path}")
+    app_name = str(cfg["app"]).strip()
+    table = f"logs_{app_name}"
+
     # Merge defaults for actors if not present in YAML
     DEFAULT_ACTORS = {
         "system_token": "(system)",
@@ -81,9 +87,6 @@ def load_pkm_from_csv(
 
     # optional constraint; fine if constraints missing
     require_message = "message" in cfg.get("constraints", {}).get("require_fields", [])
-
-    # derive table name from 'app' (fallback 'pkm')
-    table = f"logs_{cfg.get('app', 'pkm')}"
 
     con = duckdb.connect(db_path_abs)
     try:
