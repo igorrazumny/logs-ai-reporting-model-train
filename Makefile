@@ -8,7 +8,7 @@ DB_PATH       ?= outputs/pkm.duckdb
 DB            ?= $(DB_PATH)
 
 # Record limits
-N             ?= 20      # for cold runs (used to cap ingest); set N=0 to take all
+N             ?= 0      # for cold runs (used to cap ingest); set N=0 to take all
 LIMIT         ?= 0       # for show/show-save (0 = all)
 
 # Ingest directories
