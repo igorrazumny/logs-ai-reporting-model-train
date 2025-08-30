@@ -1,7 +1,6 @@
 # File: src/logs_train/ingest_dir.py
 import os
 import sys
-import time
 import shutil
 from typing import List
 
@@ -10,8 +9,8 @@ from logs_train.load import load_pkm_from_csv
 INBOX     = os.getenv("INBOX", "data/inbox")
 PROCESSED = os.getenv("PROCESSED", "data/processed")
 FAILED    = os.getenv("FAILED", "data/failed")
-YAML_PATH = os.getenv("ADAPTER_YAML", "adapters/pkm show-save DB files source data.yaml")
-DB_PATH   = os.getenv("DB_PATH", "outputs/pkm show-save DB files source data.duckdb")
+YAML_PATH = os.getenv("ADAPTER_YAML", "adapters/pkm.yaml")
+DB_PATH   = os.getenv("DB_PATH", "outputs/pkm.duckdb")
 
 def _ensure_dirs():
     os.makedirs(INBOX, exist_ok=True)
@@ -49,17 +48,15 @@ def main() -> int:
                 truncate=False
             )
             print(f"[ingest] ok: {res}")
-            # move to processed with timestamp suffix to avoid collisions
+            # move to processed; keep the original file name
             base = os.path.basename(path)
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            dst = os.path.join(PROCESSED, f"{ts}_{base}")
+            dst = os.path.join(PROCESSED, base)
             shutil.move(path, dst)
             ok += 1
         except Exception as e:
             print(f"[ingest] FAILED: {e}")
             base = os.path.basename(path)
-            ts = time.strftime("%Y%m%d_%H%M%S")
-            dst = os.path.join(FAILED, f"{ts}_{base}")
+            dst = os.path.join(FAILED, base)
             try:
                 shutil.move(path, dst)
             except Exception as move_err:
