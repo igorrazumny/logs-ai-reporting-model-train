@@ -1,16 +1,17 @@
 # File: src/logs_train/load.py
 import os
 import re
-import json
 import time
 import base64
 import requests
 import duckdb
 import yaml
-from typing import Optional, Tuple, Iterator, List
+from typing import Tuple, List
 
-# use the extracted iterator
+# Use the extracted iterator (already working)
 from logs_train.record_iter import iter_records
+# Use the extracted LLM caller (avoid circular imports; note the package path)
+from logs_train.llm_client import call_llm_single as _call_llm
 
 # ======== Basic config ========
 OLLAMA_HOST   = os.getenv("LLM_HOST", "http://ollama:11434")
@@ -22,14 +23,14 @@ REJECTS_PATH  = "outputs/pkm_rejects.log"
 LLM_TIMEOUT_S = int(os.getenv("LLM_TIMEOUT_S", "60"))
 RETRIES       = int(os.getenv("LLM_RETRIES", "2"))
 BACKOFF_S     = float(os.getenv("LLM_BACKOFF_S", "1.0"))
-MAX_RECORDS   = int(os.getenv("MAX_RECORDS", "10"))  # 0 = unlimited; default 10 for dev
+MAX_RECORDS   = int(os.getenv("MAX_RECORDS", "30"))  # 0 = unlimited; default 10 for dev
 
 # ======== YAML / helpers ========
 def _read_yaml(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-def _derive_actor(user: str, system_token: str, login_re: str, display_re: str) -> Tuple[Optional[str], Optional[str]]:
+def _derive_actor(user: str, system_token: str, login_re: str, display_re: str) -> Tuple[str, str | None]:
     """Derive (actor, actor_display) from 'Name (login)' or '(system)'."""
     if not user:
         return None, None
@@ -40,21 +41,11 @@ def _derive_actor(user: str, system_token: str, login_re: str, display_re: str) 
     m_disp  = re.search(display_re, user)
     login = m_login.group("login") if m_login else None
     disp  = m_disp.group("name").strip() if m_disp else None
-    return (login or disp or user), disp
+    actor = login or disp or user
+    return actor, disp
 
 def _truncate(s: str, n: int = 240) -> str:
     return s if len(s) <= n else s[:n] + "…"
-
-# ======== LLM call (message is base64 to preserve exact content) ========
-_SYS_PROMPT = (
-    "You are an expert log parsing engine. Return ONLY a single compact JSON object with exactly these keys:\n"
-    '["user","id","subseq_id","message_b64","audit_utc","action","type","label","version"]\n'
-    "- Do not include any other text. No markdown fences. No explanations.\n"
-    "- 'message_b64' MUST be the base64-encoded form of the exact message text from the record; do not modify it.\n"
-    "- If a value is unknown, use an empty string \"\".\n"
-    "- Examples:\n"
-    '  {\"user\":\"\",\"id\":\"1\",\"subseq_id\":\"1.23\",\"message_b64\":\"VXBkYXRlZCBNYXRlcmlhbHMgLi4u\",\"audit_utc\":\"2020-04-30 12:34:56\",\"action\":\"Change\",\"type\":\"Configuration\",\"label\":\"CONTAINER\",\"version\":\"NA\"}\n'
-)
 
 def _clean_llm_output(txt: str) -> str:
     """Strip common fences/backticks and leading 'json'."""
@@ -65,46 +56,6 @@ def _clean_llm_output(txt: str) -> str:
         clean = max(candidates, key=len) if candidates else clean
     clean = clean.lstrip().lstrip("json").lstrip()
     return clean
-
-def _call_llm(record: str, timeout_s: int = LLM_TIMEOUT_S) -> Tuple[Optional[dict], str]:
-    """Send one record to the local model. Return (parsed_json_or_None, raw_text)."""
-    prompt = f"{_SYS_PROMPT}\nLOG RECORD:\n{record}"
-    print(f"[llm] PROMPT: {_truncate(prompt)}")
-    print(f"[llm] → sending at {time.strftime('%H:%M:%S')}")
-    last_txt = ""
-    for attempt in range(RETRIES + 1):
-        try:
-            r = requests.post(
-                f"{OLLAMA_HOST}/api/generate",
-                json={"model": LLM_MODEL, "prompt": prompt, "stream": False, "options": {"temperature": 0.0}},
-                timeout=timeout_s,
-            )
-            r.raise_for_status()
-            txt = (r.json() or {}).get("response", "") if r.headers.get("content-type","").startswith("application/json") else r.text
-            txt = (txt or "").strip()
-            last_txt = txt
-            print(f"[llm] ← received at {time.strftime('%H:%M:%S')} (len={len(txt)})")
-            print(f"[llm] RAW: {_truncate(txt)}")
-            clean = _clean_llm_output(txt)
-            start, end = clean.find("{"), clean.rfind("}")
-            if start != -1 and end != -1:
-                js = clean[start:end+1]
-                try:
-                    return json.loads(js), txt
-                except Exception as e:
-                    print(f"[llm] JSON decode error: {e}")
-                    # Try a very light sanitization (no content loss): remove unsanctioned fences/whitespace only
-                    try:
-                        return json.loads(js.strip()), txt
-                    except Exception as e2:
-                        print(f"[llm] still bad JSON: {e2}")
-                        return None, txt
-            return None, txt
-        except Exception as e:
-            wait = BACKOFF_S * (2 ** attempt)
-            print(f"[llm] request error (attempt {attempt+1}/{RETRIES+1}): {e}, waiting {wait}s")
-            time.sleep(wait)
-    return None, last_txt
 
 # ======== Loader (LLM-only, no clipping, base64 message) ========
 def load_pkm_from_csv(
@@ -123,6 +74,8 @@ def load_pkm_from_csv(
     out_dir = os.path.dirname(os.path.abspath(db_path)) or "."
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(os.path.dirname(os.path.abspath(REJECTS_PATH)) or ".", exist_ok=True)
+    # EXTRA: guard container path so DuckDB always has a directory
+    os.makedirs("/app/outputs", exist_ok=True)
 
     try:
         requests.get(OLLAMA_HOST, timeout=5).raise_for_status()
@@ -158,7 +111,9 @@ def load_pkm_from_csv(
 
             parsed, raw_txt = _call_llm(rec)
             # Validate minimal schema
-            ok = parsed is not None and all(k in parsed for k in ["user","id","subseq_id","message_b64","audit_utc","action","type","label","version"])
+            ok = parsed is not None and all(
+                k in parsed for k in ["user","id","subseq_id","message_b64","audit_utc","action","type","label","version"]
+            )
             if not ok:
                 print(f"[rec#{total}] → REJECT (missing keys)")
                 rejected_lines.append(rec)
