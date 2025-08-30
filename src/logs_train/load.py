@@ -17,7 +17,7 @@ CSV_HEADER    = "User ID|ID|Subsequence ID|Message|Audit Time (UTC)|Action|Type|
 REJECTS_PATH  = "outputs/pkm_rejects.log"
 
 LLM_TIMEOUT_S = int(os.getenv("LLM_TIMEOUT_S", "60"))
-MAX_RECORDS   = int(os.getenv("MAX_RECORDS", "30"))  # 0 = unlimited
+MAX_RECORDS   = int(os.getenv("MAX_RECORDS", "100"))  # 0 = unlimited
 
 # ======== YAML / helpers ========
 def _read_yaml(path: str) -> dict:
@@ -51,13 +51,18 @@ def load_pkm_from_csv(
     print(f"[hc] Ollama = {OLLAMA_HOST}")
     print(f"[hc] Model  = {LLM_MODEL}")
 
-    # ensure outputs dir exists BEFORE opening DuckDB
-    out_dir = os.path.dirname(os.path.abspath(db_path)) or "."
-    os.makedirs(out_dir, exist_ok=True)
-    os.makedirs(os.path.dirname(os.path.abspath(REJECTS_PATH)) or ".", exist_ok=True)
-    # guard container path so DuckDB always has a directory
+    # --- Guarantee directories exist (host + container) BEFORE connecting ---
+    # Normalize db_path to absolute, then ensure its parent exists.
+    db_path_abs = os.path.abspath(db_path)
+    db_dir = os.path.dirname(db_path_abs) or "."
+    os.makedirs(db_dir, exist_ok=True)
+    # Keep your rejects log directory too
+    rej_dir = os.path.dirname(os.path.abspath(REJECTS_PATH)) or "."
+    os.makedirs(rej_dir, exist_ok=True)
+    # Belt-and-suspenders: also ensure the typical container path
     os.makedirs("/app/outputs", exist_ok=True)
 
+    # Healthcheck Ollama
     try:
         requests.get(OLLAMA_HOST, timeout=5).raise_for_status()
     except Exception as e:
@@ -66,7 +71,8 @@ def load_pkm_from_csv(
     cfg = _read_yaml(yaml_path)
     require_message = "message" in cfg.get("constraints", {}).get("require_fields", [])
 
-    con = duckdb.connect(db_path)
+    # --- Connect using the absolute db path we just ensured ---
+    con = duckdb.connect(db_path_abs)
     try:
         con.execute(
             "CREATE TABLE IF NOT EXISTS logs_pkm("
@@ -77,9 +83,9 @@ def load_pkm_from_csv(
             con.execute("DELETE FROM logs_pkm")
             print("[db] cleared logs_pkm")
 
-        total, accepted, rejects = 0, 0, 0
+        total = accepted = rejected = 0
         rejected_lines: List[str] = []
-        start = time.time()
+        t0 = time.time()
 
         for rec in iter_records(csv_path):
             if MAX_RECORDS and total >= MAX_RECORDS:
@@ -89,60 +95,58 @@ def load_pkm_from_csv(
             print(f"\n[rec#{total}] RAW: {_truncate(rec)}")
 
             parsed, _ = _call_llm(rec)
-
             # Expect plain message (no base64)
-            ok = parsed is not None and all(
-                k in parsed for k in ["user","id","subseq_id","message","audit_utc","action","type","label","version"]
-            )
-            if not ok:
-                print(f"[rec#{total}] → REJECT (missing keys)")
+            if parsed is None or not isinstance(parsed, dict):
+                print(f"[rec#{total}] → REJECT (no/invalid JSON)")
+                rejected += 1
                 rejected_lines.append(rec)
-                rejects += 1
                 continue
 
-            msg = (parsed.get("message") or "").rstrip("\r")
+            # Ensure all keys exist; fill unknown with ""
+            KEYS = ["user","id","subseq_id","message","audit_utc","action","type","label","version"]
+            data = {k: (parsed.get(k, "") if parsed.get(k, "") is not None else "") for k in KEYS}
+
+            msg = (data["message"] or "").rstrip("\r")
             if require_message and not msg.strip():
                 print(f"[rec#{total}] → REJECT (empty message)")
+                rejected += 1
                 rejected_lines.append(rec)
-                rejects += 1
                 continue
 
-            # Normalize timestamp safely (let DuckDB validate)
-            ts_raw = parsed.get("audit_utc") or None
+            # Normalize timestamp (bad values -> NULL)
+            ts_raw = data["audit_utc"] or None
             ts_val = None
             if ts_raw:
                 try:
                     ts_val = con.execute("SELECT TRY_CAST(? AS TIMESTAMP)", [ts_raw]).fetchone()[0]
-                    # If model glued extra fields into audit_utc, TRY_CAST returns None
                 except Exception:
                     ts_val = None
 
             actor, disp = _derive_actor(
-                parsed.get("user",""),
+                data["user"],
                 cfg["actors"]["system_token"],
                 cfg["actors"]["login_regex"],
                 cfg["actors"]["display_regex"],
             )
 
             vals = (
-                ts_val,                                # ts (None if unparsable)
-                actor,                                 # actor
-                disp,                                  # actor_display
-                parsed.get("label") or None,          # product
-                parsed.get("action") or None,         # action
-                parsed.get("type") or None,           # type
-                parsed.get("id") or None,             # id
-                parsed.get("subseq_id") or None,      # subseq_id
-                parsed.get("version") or None,        # version
-                msg,                                  # message
+                ts_val,
+                actor,
+                disp,
+                (data["label"] or None),
+                (data["action"] or None),
+                (data["type"] or None),
+                (data["id"] or None),
+                (data["subseq_id"] or None),
+                (data["version"] or None),
+                msg,
             )
             print(f"[rec#{total}] JSON OK → DB INSERT")
             con.execute("INSERT INTO logs_pkm VALUES (?,?,?,?,?,?,?,?,?,?)", vals)
             accepted += 1
 
-        ratio = (accepted/total) if total else 0.0
-        elapsed = time.time()-start
-        print(f"\n[done] inserted={accepted} seen={total} rejected={rejects} ratio={ratio:.1%} time={elapsed:.1f}s")
-        return {"inserted":accepted,"db":db_path,"seen":total,"rejected":rejects,"ok_ratio":ratio}
+        ratio = (accepted / total) if total else 0.0
+        print(f"\n[done] inserted={accepted} seen={total} rejected={rejected} ratio={ratio:.1%} time={time.time()-t0:.1f}s")
+        return {"inserted": accepted, "db": db_path_abs, "seen": total, "rejected": rejected, "ok_ratio": ratio}
     finally:
         con.close()
