@@ -1,7 +1,6 @@
 # File: docker-compose.yml
 
 services:
-  # Local LLM (single 8B model) — used by planner/presenter.
   ollama:
     image: ollama/ollama:latest
     container_name: ollama
@@ -15,24 +14,25 @@ services:
     build:
       context: .
       args:
-        BASE: "cpu"          # set to "cuda" if you add a CUDA base later
+        BASE: "cpu"
     image: logs-train:cpu
     container_name: logs-train
     environment:
       - PYTHONUNBUFFERED=1
       - LLM_HOST=http://ollama:11434
-      - LLM_MODEL=llama3.1-8b-instruct-q4_K_M
+      - LOG_LLM_MODEL=${LOG_LLM_MODEL}   # must be set, no default
+      - SQL_LLM_MODEL=${SQL_LLM_MODEL}   # must be set, no default
+      - LOAD_VERBOSE=1
+      - LOAD_TICK_SEC=1
+      - LOAD_PROGRESS_EVERY=500
     volumes:
-      - ./src:/app/src            # live-mount code for fast dev, no rebuilds
-      - ./data:/app/data          # local CSVs (gitignored)
-      - ./outputs:/app/outputs    # DuckDB, logs (gitignored)
-      - ./adapters:/app/adapters  # YAML adapters
-      - ./docs:/app/docs          # optional, if UI links docs
+      - ./src:/app/src
+      - ./data:/app/data
+      - ./outputs:/app/outputs
+      - ./adapters:/app/adapters
+      - ./docs:/app/docs
     depends_on:
       - ollama
-    # We invoke modules explicitly via `make` (overrides entrypoint/cmd):
-    #   make load CSV="data/pkm/2020-04 Source Logs.csv"
-    #   make ui
 
 volumes:
   ollama:
