@@ -31,23 +31,30 @@ llm-pull-8b:
 	docker exec -it ollama ollama pull llama3.1:8b-instruct-q4_K_M
 
 llm-pull-3b:
-	# Pull the faster 3B model (recommended for development on CPU)
+	# Pull the 3B model (recommended for development on CPU)
 	docker compose up -d ollama
 	docker exec -it ollama ollama pull llama3.2:3b-instruct-q4_K_M
 
 llm-list:
 	docker exec -it ollama ollama list
 
+# ========== Ensure host dirs exist ==========
+.PHONY: init
+init:
+	mkdir -p outputs
+	mkdir -p data
+
 # ========== Loader (runs inside Docker) ==========
 # Usage: make load CSV="data/pkm/2020-04 Source Logs.csv"
 .PHONY: load
-load:
+load: init
 	test -n "$(CSV)" || (echo "Set CSV=<path> e.g. CSV='data/pkm/2020-04 Source Logs.csv'"; exit 2)
-	docker compose run --rm app python -m src.logs_train.cli load-pkm "$(CSV)"
+	# Guard inside the container too, so /app/outputs always exists even if the bind mount is empty/missing.
+	docker compose run --rm app sh -lc 'mkdir -p /app/outputs && python -m src.logs_train.cli load-pkm "$(CSV)"'
 
 # ========== Streamlit UI (inside Docker) ==========
 .PHONY: ui
-ui:
+ui: init
 	# Exposes Streamlit on http://localhost:8501
 	docker compose run --rm -p 8501:8501 app python -m src.logs_train.ui_streamlit
 
@@ -59,17 +66,19 @@ first-run: build up llm-pull-3b
 	@echo "Then run the UI with:"
 	@echo "  make ui"
 
-# ========== Cold start (reset DB + limited run on 3B model) ==========
+# ========== Cold start (reset DB + limited run; model comes from .env) ==========
 # Usage: make cold CSV="data/pkm/2020-04 Source Logs.csv" [N=20]
 # - Shuts down containers
+# - Ensures outputs/ dir exists
 # - Removes DuckDB file
 # - Starts containers
-# - Loads using the 3B model with MAX_RECORDS=N (default 20)
+# - Loads using LOG_LLM_MODEL from .env with MAX_RECORDS=N (default 20)
 N ?= 20
 .PHONY: cold
 cold:
 	test -n "$(CSV)" || (echo "Set CSV=<path> e.g. CSV='data/pkm/2020-04 Source Logs.csv'"; exit 2)
 	$(MAKE) down
+	$(MAKE) init
 	rm -f outputs/pkm.duckdb
 	$(MAKE) up
-	LLM_MODEL="llama3.2:3b-instruct-q4_K_M" MAX_RECORDS=$(N) $(MAKE) load CSV="$(CSV)"
+	MAX_RECORDS=$(N) $(MAKE) load CSV="$(CSV)"

@@ -9,6 +9,9 @@ import duckdb
 import yaml
 from typing import Optional, Tuple, Iterator, List
 
+# use the extracted iterator
+from logs_train.record_iter import iter_records
+
 # ======== Basic config ========
 OLLAMA_HOST   = os.getenv("LLM_HOST", "http://ollama:11434")
 # Default to faster 1B model for development (override via LLM_MODEL env)
@@ -41,46 +44,6 @@ def _derive_actor(user: str, system_token: str, login_re: str, display_re: str) 
 
 def _truncate(s: str, n: int = 240) -> str:
     return s if len(s) <= n else s[:n] + "…"
-
-# ======== Record iterator (balanced quotes only; no content changes) ========
-def _iter_records(path: str) -> Iterator[str]:
-    """
-    Yield logical records where the full record is quoted and may contain pipes/newlines.
-    Boundary rule: quotes must be balanced (we are not inside a quoted segment).
-    Header rows are skipped (quoted or not, BOM-tolerant).
-    """
-    HEADER = CSV_HEADER
-    buf = ""
-    in_q = False
-    with open(path, "r", encoding="utf-8", newline="") as fh:
-        for line in fh:
-            line = line.rstrip("\r\n")
-            if not line and not buf:
-                continue
-            buf = line if not buf else f"{buf}\n{line}"
-
-            # Skip header (quoted or not; allow BOM)
-            probe = buf.strip().lstrip("\ufeff").strip('"')
-            if probe == HEADER:
-                buf, in_q = "", False
-                continue
-
-            # Update quote state using the new line only
-            i = 0
-            while i < len(line):
-                if line[i] == '"':
-                    if in_q and i + 1 < len(line) and line[i + 1] == '"':
-                        i += 2
-                        continue
-                    in_q = not in_q
-                i += 1
-
-            # Boundary = balanced quotes
-            if not in_q and buf:
-                yield buf
-                buf = ""
-        if buf and not in_q:
-            yield buf
 
 # ======== LLM call (message is base64 to preserve exact content) ========
 _SYS_PROMPT = (
@@ -185,7 +148,7 @@ def load_pkm_from_csv(
         rejected_lines: List[str] = []
         start = time.time()
 
-        for rec in _iter_records(csv_path):
+        for rec in iter_records(csv_path):
             if MAX_RECORDS and total >= MAX_RECORDS:
                 print(f"\n[stop] MAX_RECORDS={MAX_RECORDS} reached — stopping early.")
                 break
