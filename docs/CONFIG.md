@@ -1,11 +1,11 @@
 # Config — logs-ai-reporting-model-train
 
 ## 0) Scope & Ownership
-- Repo: **private / proprietary** (see LICENSE.txt).
+- Repo: **private / proprietary** (see LICENSE.txt). 
 - Owner: Razum GmbH (brand: RazumAI).
 - Purpose: training per-application NL→SQL models (LoRA/QLoRA) + evaluation.
 
-## 1) Data Handling (must-read)
+## 1) Data Handling
 - Input data **must be anonymized on client premises** before inclusion here.
 - Allowed formats: Parquet (.parquet), JSONL (.jsonl). No raw PII.
 - Canonical table: `raw_logs(ts, source, actor, action, object, duration_ms, project, payload_json)`.
