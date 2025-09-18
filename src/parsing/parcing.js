@@ -1,9 +1,9 @@
 // File: drive_month_xlsx_only_shared_drive.gs
 // Parse one month per run; EXPORT XLSX ONLY; Shared Drive compatible.
-// Auto-split via constants (not defaults). Robust cleanup.
-// Chunked CSV download fallback. RESUMABLE, STREAMING part export (no giant staging Sheet).
+// v1: single-file runner kept for backward-compat.
+// v2: folder-wide runner with unprocessed-line sink + live logging.
 
-// ========= REQUIRED CONFIG =========
+// ========= REQUIRED CONFIG (v1) =========
 const DRIVE_FOLDER_ID = '1GDJifQIErKsKwUuQta2ILXmVyvOSiEk6';
 const OUTPUT_SUBFOLDER = 'parced';
 
@@ -27,10 +27,30 @@ const AUTORETRY_MINUTES  = 1;
 
 // Job state key (Script Properties)
 const JOB_KEY = 'LOGS_XLSX_JOB_STREAM_V1';
+
+// ========= V2 CONFIG (folder-wide) =========
+const OUTPUT_SUBFOLDER_V2   = 'parced2';
+const BADLINES_SUBFOLDER_V2 = 'parced2_unprocessed';
+const LOGS_SUBFOLDER_V2     = 'parced2_logs';
+const LOG_BOOK_TITLE_V2     = 'Parse v2 — Execution Log';
+const BADLINES_MAX_ROWS     = 200000;      // rollover threshold (rows per bad-lines GSheet)
+const BETWEEN_PARTS_DELAY_MIN  = 1;        // schedule delay between parts (same file)
+const BETWEEN_FILES_DELAY_MIN  = 2;        // schedule delay between files
+
+// V2 job keys
+const JOB_KEY_V2       = 'LOGS_XLSX_JOB_STREAM_V2';
+const JOB_QUEUE_KEY_V2 = 'LOGS_XLSX_JOB_QUEUE_V2';
+
+// ========= INTERNAL (used by parser) =========
+var GLOBAL_CURRENT_FILE_NAME = '';  // set by v2 processor to stamp bad-lines
+
+// ---------- Time formatting (CET/CEST) ----------
+function formatCET(d) {
+  return Utilities.formatDate(d, 'Europe/Zurich', "yyyy-MM-dd HH:mm:ss z");
+}
+
 // ==================================
-
-
-// ---------------- Public: pick from Run menu ----------------
+// ---------------- Public: v1 month runners ----------------
 
 function run_month(year, month) {
   const ym = String(year) + '-' + ('0' + Number(month)).slice(-2);
@@ -91,7 +111,7 @@ function run_2025_06(){ run_month(2025,6); }
 function run_2025_07(){ run_month(2025,7); }
 function run_2025_08(){ run_month(2025,8); }
 
-// Manual resume (click to advance immediately)
+// Manual resume (v1)
 function resume_current_job() {
   const job = loadJob_();
   if (!job) { Logger.log('No active job.'); return; }
@@ -99,8 +119,99 @@ function resume_current_job() {
   processJobStreaming_(job);
 }
 
+// ---------------- Public: v2 folder-wide runners ----------------
 
-// ---------------- Backfill helpers (unchanged logic) ----------------
+// Parse YYYY/MM from name (newest-first sorting)
+function parseYearMonthFromName_(name) {
+  const MONTHS = {january:1,february:2,march:3,april:4,may:5,june:6,
+                  july:7,august:8,september:9,october:10,november:11,december:12};
+  const base = name.replace(/\.csv$/i,'');
+  let m = base.match(/(january|february|march|april|may|june|july|august|september|october|november|december)\s*([0-9]{4})/i);
+  if (m) return { y: Number(m[2]), m: MONTHS[m[1].toLowerCase()] };
+  m = base.match(/([0-9]{4})[-_ ]?([0-9]{2})\b/);
+  if (m) return { y: Number(m[1]), m: Number(m[2]) };
+  return null;
+}
+
+// Queues ALL CSVs and starts with the newest first
+function run_all_v2() {
+  const parent = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+  const items = [];
+  const it = parent.getFiles();
+  while (it.hasNext()) {
+    const f = it.next();
+    const name = f.getName();
+    if (!/\.csv$/i.test(name)) continue;
+    const ym = parseYearMonthFromName_(name);
+    items.push({id:f.getId(), name:name, ym:ym});
+  }
+  items.sort(function(a,b){
+    if (a.ym && b.ym) {
+      if (a.ym.y !== b.ym.y) return b.ym.y - a.ym.y;
+      if (a.ym.m !== b.ym.m) return b.ym.m - a.ym.m;
+      return b.name.localeCompare(a.name);
+    } else if (a.ym && !b.ym) return -1;
+    else if (!a.ym && b.ym) return 1;
+    return b.name.localeCompare(a.name);
+  });
+
+  PropertiesService.getScriptProperties().setProperty(JOB_QUEUE_KEY_V2, JSON.stringify({idx:0, items:items}));
+  PropertiesService.getScriptProperties().deleteProperty(JOB_KEY_V2);
+  resume_all_v2();
+}
+
+// Resumes v2 (called by trigger or manually). Handles between-parts and between-files scheduling.
+function resume_all_v2() {
+  // heartbeat so we see every wake-up
+  logRun_('resume_tick', '', '', '', '', 'ok', formatCET(new Date()));
+
+  const parent = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+  ensureFolder(parent, OUTPUT_SUBFOLDER_V2);
+  ensureFolder(parent, BADLINES_SUBFOLDER_V2);
+  ensureFolder(parent, LOGS_SUBFOLDER_V2);
+
+  const rawQ = PropertiesService.getScriptProperties().getProperty(JOB_QUEUE_KEY_V2);
+  if (!rawQ) { Logger.log('No queue.'); return; }
+  const q = JSON.parse(rawQ);
+  if (q.idx >= q.items.length) {
+    Logger.log('Queue finished.');
+    logProgress_('', '', '', '', 'idle','all complete');
+    return;
+  }
+
+  let job = loadJobV2_();
+  if (!job) {
+    const cur = q.items[q.idx];
+    precleanChunkArtifacts_(ensureFolder(parent, OUTPUT_SUBFOLDER_V2), makeOutputBaseV2_(cur.name));
+    job = {
+      fileId: cur.id,
+      fileName: cur.name,
+      outputBase: makeOutputBaseV2_(cur.name),
+      totalRows:0, totalCols:0, dataCursor:0, partIndex:1
+    };
+    saveJobV2_(job);
+  }
+
+  processJobStreamingV2_(job);
+
+  // If file finished, advance queue and schedule next file
+  if (!loadJobV2_()) {
+    q.idx += 1;
+    PropertiesService.getScriptProperties().setProperty(JOB_QUEUE_KEY_V2, JSON.stringify(q));
+    if (q.idx < q.items.length) {
+      scheduleResumeAt_(BETWEEN_FILES_DELAY_MIN, 'resume_all_v2_safe');
+      const nextAt = new Date(Date.now()+BETWEEN_FILES_DELAY_MIN*60*1000);
+      logRun_('file_done', job.fileName, '', '', job.totalRows, 'ok', formatCET(nextAt));
+      logProgress_(q.items[q.idx].name, 0, 0, 0, 'queued next file', '');
+    } else {
+      logRun_('all_done','', '', '', '', 'ok','');
+      logProgress_('', '', '', '', 'idle','all complete');
+    }
+  }
+}
+
+// ==================================
+// ---------------- Backfill helpers (v1 unchanged) ----------------
 
 function export_all_existing_parced_to_xlsx() {
   assertAdvancedDrive_();
@@ -150,8 +261,8 @@ function export_all_existing_parced_to_xlsx_in_chunks(chunkSize) {
   Logger.log('Done. Chunk-exported sheets: ' + made);
 }
 
-
-// ---------------- Core range runner (streams parts; resumable) ----------------
+// ==================================
+// ---------------- Core range runner (v1, streams parts; resumable) ----------------
 
 function run_range(fromYMonth, toYMonth) {
   const t0 = new Date();
@@ -228,21 +339,20 @@ function run_range(fromYMonth, toYMonth) {
   Logger.log('Range handler finished. Elapsed: ' + Math.round((t1 - t0)/1000) + 's');
 }
 
-
-// ---------------- Streaming job processor ----------------
+// ==================================
+// ---------------- Streaming job processor (v1) ----------------
 
 function processJobStreaming_(job) {
   const parent = DriveApp.getFolderById(DRIVE_FOLDER_ID);
   const outFolder = ensureSubfolder(parent, OUTPUT_SUBFOLDER);
 
-  // Read + parse (fresh each run; avoids persisting giant arrays)
   const file = DriveApp.getFileById(job.fileId);
   const lines = readCsvLinesReliably_(file);
   if (lines.length === 0) { Logger.log('Empty file, skip.'); clearJob_(); return; }
 
   Logger.log('Input lines (incl header): ' + lines.length);
 
-  const table = parseLinesToTable(lines);
+  const table = parseLinesToTable(lines, /*strictBadSink*/null);
   Logger.log('Parsed rows (incl header): ' + table.length);
 
   if (!job.totalRows || !job.totalCols) {
@@ -252,21 +362,15 @@ function processJobStreaming_(job) {
   const header = [table[0]];
   const totalDataRows = job.totalRows - 1;
 
-  // per-temp-sheet rows allowed by cell limit (ensure header + rows fit)
   const rowsAllowed = Math.floor(SHEET_CELL_LIMIT / job.totalCols);
   const dataRowsAllowedByCellCap = Math.max(1, rowsAllowed - 1);
-
-  // our policy limit for one XLSX part
   const dataRowsAllowedByPolicy = AUTO_SPLIT_CHUNK_ROWS;
-
-  // we won't write more than per-run cap
   let remainingThisRun = MAX_WRITE_ROWS_PER_RUN;
 
   while (job.dataCursor < totalDataRows && remainingThisRun > 0) {
     const dataLeft = totalDataRows - job.dataCursor;
     const partDataRows = Math.min(dataLeft, remainingThisRun, dataRowsAllowedByPolicy, dataRowsAllowedByCellCap);
 
-    // Create a small temp Sheet for just this part
     const tempName = job.outputBase + '__part' + String(job.partIndex).padStart(2, '0');
     precleanChunkArtifacts_(outFolder, tempName);
 
@@ -275,23 +379,17 @@ function processJobStreaming_(job) {
     const sh = tmp.getSheets()[0];
     sh.setName('Parsed');
 
-    // Write header
-    sh.getRange(1, 1, 1, job.totalCols).setValues(header);
-
-    // Write this part in WRITE_CHUNK_ROWS slices
     let written = 0;
     while (written < partDataRows) {
       const size = Math.min(WRITE_CHUNK_ROWS, partDataRows - written);
-      const startIdxInTable = 1 + job.dataCursor + written; // +1 to skip header in table
+      const startIdxInTable = 1 + job.dataCursor + written;
       const slice = table.slice(startIdxInTable, startIdxInTable + size);
       sh.getRange(2 + written, 1, slice.length, job.totalCols).setValues(slice);
       written += size;
       Logger.log('Part ' + job.partIndex + ' — wrote ' + written + ' / ' + partDataRows + ' rows');
       SpreadsheetApp.flush();
-      Utilities.sleep(50);
     }
 
-    // Export this single part directly to XLSX and clean
     exportSpreadsheetToXlsx_(tmp.getId(), outFolder, tempName + '.xlsx');
     Logger.log('Exported XLSX: ' + tempName + '.xlsx');
 
@@ -299,7 +397,6 @@ function processJobStreaming_(job) {
     forceTrashIfExistsByName_(outFolder, tempName);
     Logger.log('Trashed temp Sheet: ' + tempName);
 
-    // Advance streaming cursor
     job.dataCursor += partDataRows;
     job.partIndex += 1;
     remainingThisRun -= partDataRows;
@@ -307,27 +404,7 @@ function processJobStreaming_(job) {
   }
 
   if (job.dataCursor >= totalDataRows) {
-    // Finished all parts. If totalDataRows <= threshold, also build single-file XLSX.
-    if (totalDataRows <= AUTO_SPLIT_THRESHOLD_ROWS) {
-      const tempSingle = SpreadsheetApp.create(job.outputBase);
-      moveFileToFolder(DriveApp.getFileById(tempSingle.getId()), outFolder);
-      const shs = tempSingle.getSheets()[0];
-      shs.setName('Parsed');
-
-      let written = 0;
-      while (written < table.length) {
-        const size = Math.min(WRITE_CHUNK_ROWS, table.length - written);
-        const slice = table.slice(written, written + size);
-        shs.getRange(1 + written, 1, slice.length, job.totalCols).setValues(slice);
-        written += size;
-        SpreadsheetApp.flush();
-        Utilities.sleep(50);
-      }
-      exportSpreadsheetToXlsx_(tempSingle.getId(), outFolder, job.outputBase + '.xlsx');
-      trashFile_(tempSingle.getId());
-      Logger.log('Also exported single XLSX: ' + job.outputBase + '.xlsx');
-    }
-
+    // Finished all parts. Single-file XLSX export disabled.
     clearJob_();
     Logger.log('All parts completed for ' + job.outputBase);
     return;
@@ -341,13 +418,14 @@ function processJobStreaming_(job) {
   }
 }
 
-
-// ---------------- Helpers ----------------
+// ==================================
+// ---------------- Helpers (folders, trash, IO) ----------------
 
 function ensureSubfolder(parent, name) {
   const it = parent.getFoldersByName(name);
   return it.hasNext() ? it.next() : parent.createFolder(name);
 }
+function ensureFolder(parent, name) { return ensureSubfolder(parent, name); }
 
 function moveFileToFolder(file, folder) {
   folder.addFile(file);
@@ -409,7 +487,6 @@ function precleanChunkArtifacts_(folder, outBaseName) {
     }
   }
 }
-
 
 // -------- CSV reading (convert first, chunked download fallback) --------
 
@@ -512,7 +589,6 @@ function readCsvByChunkedDownload_(fileId) {
   return lines;
 }
 
-
 // ---------------- XLSX export helpers ----------------
 
 function exportSpreadsheetToXlsx_(ssId, outFolder, xlsxName) {
@@ -587,12 +663,14 @@ function exportSheetToXlsxInChunks_(ssId, outFolder, outBaseName, chunkSize) {
   }
 }
 
-
+// ==================================
 // -------------- Parsing + session logic --------------
 
-function parseLinesToTable(lines) {
-  const rawHeader = lines[0].split('|').map(function (s) { return s.trim() });
-  const header = rawHeader.map(function (h) { return h.replace(/\s+/g, '_').replace(/[^\w]/g, '').toLowerCase() });
+// v2-compatible parser: tries to normalize; if impossible and a badSink is provided,
+// the raw line is appended to the bad-lines GSheet and the row is skipped.
+function parseLinesToTable(lines, badSink) {
+  const rawHeader = lines[0].split('|').map(function (s) { return s.trim(); });
+  const header = rawHeader.map(function (h) { return h.replace(/\s+/g, '_').replace(/[^\w]/g, '').toLowerCase(); });
 
   header.push(
     'recipe_id','recipe_name','material_name','material_id',
@@ -600,87 +678,42 @@ function parseLinesToTable(lines) {
     'session_start','session_end','session_duration'
   );
 
-  const RX_QUOTED = /^\s*([^|]*)\|([^|]*)\|([^|]*)\|"(.*?)"\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\s*$/;
-  const RX_PLAIN  = /^\s*([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\|([^|]*)\s*$/;
-
-  function splitUser(userIdRaw) {
-    const m = String(userIdRaw).match(/^(.*?)(?:\s*\(([^)]+)\))?\s*$/);
-    const namePart = m && m[1] ? m[1].trim() : String(userIdRaw).trim();
-    const username = m && m[2] ? m[2].trim() : '';
-    const i = namePart.indexOf(' ');
-    const name1 = i === -1 ? namePart : namePart.slice(0, i).trim();
-    const name2 = i === -1 ? ''       : namePart.slice(i + 1).trim();
-    return { name1: name1, name2: name2, username: username };
-  }
-  function extractRecipeId(msg) {
-    const s = String(msg);
-    let m = s.match(/Recipe ID:\s*'([^']+)'/i);
-    if (m) return m[1].trim();
-    m = s.match(/Recipe ID:\s*([^|,'"]+)/i);
-    if (m) return m[1].trim();
-    m = s.match(/\brecipe_[^|,\s]+/i);
-    if (m) return m[0].trim();
-    return '';
-  }
-  function extractMaterialName(msg) {
-    const m = String(msg).match(/Material Name\s*=\s*([^|]+)/i);
-    return m ? m[1].trim() : '';
-  }
-  function extractMaterialId(msg) {
-    const m = String(msg).match(/Material ID\s*=\s*([0-9]+)/i);
-    return m ? m[1].trim() : '';
-  }
-  function isStart(msg) {
-    return /(^|\s)checked out recipe\b/i.test(String(msg));
-  }
-  function isEnd(msg) {
-    const s = String(msg);
-    return /(^|\s)checked in recipe\b/i.test(s)
-        || /(^|\s)discarded checkout\b/i.test(s)
-        || /(^|\s)updated recipe\b/i.test(s)
-        || /(^|\s)auto-check in\b/i.test(s);
-  }
-  function isAutoCheckIn(msg) {
-    return /(^|\s)auto-check in\b/i.test(String(msg));
-  }
-  function makeKey(username, userIdRaw, recipeId, recipeName) {
-    const who = username || String(userIdRaw);
-    const what = recipeId || recipeName || '';
-    return who + '|' + what;
-  }
-
   const out = [header];
   const rowMeta = [];
   const startsByKey = {};
   let nextParseLog = 10000;
 
-  // PASS 1
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i];
     if (!line) continue;
 
-    let m = line.match(RX_QUOTED);
-    if (!m) m = line.match(RX_PLAIN);
-    if (!m) continue;
+    const raw = String(line);
+    const cells0 = splitPipesQuoted(raw).map(function (s) { return String(s).trim(); });
+    const norm = tryToNine_(cells0);
+
+    if (!norm.ok) {
+      if (badSink) appendBadLine_(badSink.fileName, i + 1, raw, norm.reason);
+      continue;
+    }
 
     // [User ID, ID, Subseq ID, Message, Audit Time, Action, Type, Label, Version]
-    const cols = m.slice(1).map(function (s) { return String(s).trim() });
+    const cols = norm.cols;
     const userIdRaw = cols[0];
     const message   = cols[3];
     const auditRaw  = cols[4];
     const typeVal   = cols[6];
     const labelVal  = cols[7];
 
-    const ts = auditRaw ? new Date(auditRaw) : null;
+    const ts = safeParseTs_(auditRaw);
 
-    const ridRaw = extractRecipeId(message);
+    const ridRaw = extractRecipeId_(message);
     const rid = ridRaw.split('|')[0].trim();
 
     const rname = /^recipe$/i.test(String(typeVal)) ? String(labelVal) : '';
 
-    const mname = extractMaterialName(message);
-    const mid   = extractMaterialId(message);
-    const u     = splitUser(userIdRaw);
+    const mname = extractMaterialName_(message);
+    const mid   = extractMaterialId_(message);
+    const u     = splitUser_(userIdRaw);
     const action= message ? message.trim().split(/\s+/).slice(0, 4).join(' ') : '';
 
     const base = cols.slice();
@@ -689,8 +722,8 @@ function parseLinesToTable(lines) {
     const outIndex = out.length;
     out.push(base);
 
-    const key = makeKey(u.username, userIdRaw, rid, rname);
-    const meta = { key: key, isStart: isStart(message), isEnd: isEnd(message), isAutoEnd: isAutoCheckIn(message), ts: ts, outIndex: outIndex };
+    const key = makeKey_(u.username, userIdRaw, rid, rname);
+    const meta = { key: key, isStart: isStart_(message), isEnd: isEnd_(message), isAutoEnd: isAutoCheckIn_(message), ts: ts, outIndex: outIndex };
     rowMeta.push(meta);
 
     if (meta.isStart) {
@@ -705,7 +738,7 @@ function parseLinesToTable(lines) {
     }
   }
 
-  // PASS 2
+  // PASS 2: close sessions
   for (let j = 0; j < rowMeta.length; j++) {
     const meta = rowMeta[j];
     if (!meta.isEnd || !meta.ts) continue;
@@ -738,22 +771,98 @@ function parseLinesToTable(lines) {
   return out;
 }
 
+// ===== parser helpers (no defaults) =====
 
-// ---------------- Job persistence & auto-resume ----------------
+function splitUser_(userIdRaw) {
+  const m = String(userIdRaw).match(/^(.*?)(?:\s*\(([^)]+)\))?\s*$/);
+  const namePart = m && m[1] ? m[1].trim() : String(userIdRaw).trim();
+  const username = m && m[2] ? m[2].trim() : '';
+  const i = namePart.indexOf(' ');
+  const name1 = i === -1 ? namePart : namePart.slice(0, i).trim();
+  const name2 = i === -1 ? ''       : namePart.slice(i + 1).trim();
+  return { name1: name1, name2: name2, username: username };
+}
+function extractRecipeId_(msg) {
+  const s = String(msg);
+  let m = s.match(/Recipe ID:\s*'([^']+)'/i);
+  if (m) return m[1].trim();
+  m = s.match(/Recipe ID:\s*([^|,'"]+)/i);
+  if (m) return m[1].trim();
+  m = s.match(/\brecipe_[^|,\s]+/i);
+  if (m) return m[0].trim();
+  return '';
+}
+function extractMaterialName_(msg) {
+  const m = String(msg).match(/Material Name\s*=\s*([^|]+)/i);
+  return m ? m[1].trim() : '';
+}
+function extractMaterialId_(msg) {
+  const m = String(msg).match(/Material ID\s*=\s*([0-9]+)/i);
+  return m ? m[1].trim() : '';
+}
+function isStart_(msg) { return /(^|\s)checked out recipe\b/i.test(String(msg)); }
+function isEnd_(msg) {
+  const s = String(msg);
+  return /(^|\s)checked in recipe\b/i.test(s)
+      || /(^|\s)discarded checkout\b/i.test(s)
+      || /(^|\s)updated recipe\b/i.test(s)
+      || /(^|\s)auto-check in\b/i.test(s);
+}
+function isAutoCheckIn_(msg) { return /(^|\s)auto-check in\b/i.test(String(msg)); }
+function makeKey_(username, userIdRaw, recipeId, recipeName) {
+  const who = username || String(userIdRaw);
+  const what = recipeId || recipeName || '';
+  return who + '|' + what;
+}
+
+// Split a pipe-delimited line with CSV-like quotes and "" escaping.
+function splitPipesQuoted(line) {
+  const out = []; let cur = ''; let inQ = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQ && i + 1 < line.length && line[i + 1] === '"') { cur += '"'; i++; }
+      else { inQ = !inQ; }
+    } else if (ch === '|' && !inQ) {
+      out.push(cur); cur = '';
+    } else {
+      cur += ch;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+// Expect 9 fields. If >9, merge extras back into Message; if <9, pad.
+function tryToNine_(cells) {
+  if (cells.length === 9) return { ok:true, cols:cells, reason:'' };
+  if (cells.length > 9) {
+    if (cells.length >= 10) {
+      const head = cells.slice(0,3);
+      const msg  = cells.slice(3, cells.length - 5).join('|');
+      const tail = cells.slice(cells.length - 5);
+      return { ok:true, cols: head.concat([msg]).concat(tail), reason:'COERCED' };
+    }
+    return { ok:false, reason:'TOO_MANY_FIELDS' };
+  }
+  const padded = cells.slice();
+  while (padded.length < 9) padded.push('');
+  return { ok:true, cols:padded, reason:'PADDED' };
+}
+
+// ==================================
+// ---------------- Job persistence & auto-resume (v1) ----------------
 
 function saveJob_(job) {
   PropertiesService.getScriptProperties().setProperty(JOB_KEY, JSON.stringify(job));
 }
-
 function loadJob_() {
   const raw = PropertiesService.getScriptProperties().getProperty(JOB_KEY);
   return raw ? JSON.parse(raw) : null;
 }
-
 function clearJob_() {
   PropertiesService.getScriptProperties().deleteProperty(JOB_KEY);
 }
-
 function scheduleResume_() {
   const triggers = ScriptApp.getProjectTriggers();
   for (var i = 0; i < triggers.length; i++) {
@@ -763,4 +872,294 @@ function scheduleResume_() {
     }
   }
   ScriptApp.newTrigger('resume_current_job').timeBased().after(AUTORETRY_MINUTES * 60 * 1000).create();
+}
+
+// ==================================
+// ---------------- V2: persistence, scheduling, logging, bad-lines  ----------------
+
+function saveJobV2_(job){ PropertiesService.getScriptProperties().setProperty(JOB_KEY_V2, JSON.stringify(job)); }
+function loadJobV2_(){ const raw=PropertiesService.getScriptProperties().getProperty(JOB_KEY_V2); return raw?JSON.parse(raw):null; }
+function clearJobV2_(){ PropertiesService.getScriptProperties().deleteProperty(JOB_KEY_V2); }
+
+// robust trigger creator with logging (CET)
+function scheduleResumeAt_(minutes, handler) {
+  const whenMs = minutes * 60 * 1000;
+  const eta = new Date(Date.now() + whenMs);
+
+  // remove stale triggers for this handler
+  const triggers = ScriptApp.getProjectTriggers();
+  for (var i = 0; i < triggers.length; i++) {
+    var t = triggers[i];
+    if (t.getHandlerFunction && (t.getHandlerFunction() === handler)) {
+      ScriptApp.deleteTrigger(t);
+    }
+  }
+
+  try {
+    ScriptApp.newTrigger(handler).timeBased().at(eta).create();
+    logRun_('trigger_set', '', '', '', '', 'ok', formatCET(eta));
+  } catch (e) {
+    try {
+      ScriptApp.newTrigger(handler).timeBased().after(whenMs).create();
+      logRun_('trigger_set_after', '', '', '', '', 'ok', formatCET(eta));
+    } catch (e2) {
+      logRun_('trigger_error', '', '', '', '', 'error: ' + e2, '');
+      throw e2;
+    }
+  }
+}
+
+function getLogBook_() {
+  const parent = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+  const logsFolder = ensureFolder(parent, LOGS_SUBFOLDER_V2);
+  const it = logsFolder.getFilesByName(LOG_BOOK_TITLE_V2);
+  if (it.hasNext()) return SpreadsheetApp.open(it.next());
+  const ss = SpreadsheetApp.create(LOG_BOOK_TITLE_V2);
+  moveFileToFolder(DriveApp.getFileById(ss.getId()), logsFolder);
+  const runs = ss.getSheets()[0]; runs.setName('runs');
+  runs.appendRow(['ts','phase','file','part','rows_written','total_rows','status','next_resume_at']);
+  const progress = ss.insertSheet('progress');
+  progress.getRange(1,1,1,7).setValues([['ts','current_file','part','cursor','total_rows','status','note']]);
+  return ss;
+}
+function logRun_(phase, fileName, part, rowsWritten, totalRows, status, nextResumeAt) {
+  const ss = getLogBook_();
+  ss.getSheetByName('runs').appendRow([
+    formatCET(new Date()), phase, fileName, String(part),
+    String(rowsWritten), String(totalRows), status || '',
+    nextResumeAt ? (typeof nextResumeAt === 'string' ? nextResumeAt : formatCET(nextResumeAt)) : ''
+  ]);
+}
+function logProgress_(fileName, part, cursor, total, status, note) {
+  const ss = getLogBook_();
+  const sh = ss.getSheetByName('progress');
+  sh.getRange(2,1,1,7).setValues([[
+    formatCET(new Date()), fileName, String(part),
+    String(cursor), String(total), status||'', note||''
+  ]]);
+}
+
+function getBadLinesBook_(rollSuffix) {
+  const parent = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+  const badFolder = ensureFolder(parent, BADLINES_SUBFOLDER_V2);
+  const name = 'unprocessed_lines' + (rollSuffix ? ('__' + rollSuffix) : '');
+  const it = badFolder.getFilesByName(name);
+  if (it.hasNext()) return SpreadsheetApp.open(it.next());
+  const ss = SpreadsheetApp.create(name);
+  moveFileToFolder(DriveApp.getFileById(ss.getId()), badFolder);
+  const sh = ss.getSheets()[0]; sh.setName('raw');
+  sh.appendRow(['file','orig_line_no','raw_line','reason']);
+  return ss;
+}
+function appendBadLine_(fileName, lineNo, raw, reason) {
+  let ss = getBadLinesBook_('');
+  let sh = ss.getSheets()[0];
+  if (sh.getLastRow() >= BADLINES_MAX_ROWS) {
+    const stamp = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd_HHmmss');
+    ss = getBadLinesBook_(stamp);
+    sh = ss.getSheets()[0];
+  }
+  sh.appendRow([fileName, String(lineNo), raw, reason || 'NOT_PROCESSED']);
+}
+
+// handy debug helpers
+function v2_list_triggers() {
+  const ts = ScriptApp.getProjectTriggers().map(function(t){ return {fn:t.getHandlerFunction(), type:'timeBased'}; });
+  Logger.log(JSON.stringify(ts));
+}
+function v2_debug_status() {
+  const rawQ = PropertiesService.getScriptProperties().getProperty(JOB_QUEUE_KEY_V2);
+  const rawJ = PropertiesService.getScriptProperties().getProperty(JOB_KEY_V2);
+  Logger.log('QUEUE: ' + (rawQ ? rawQ : 'null'));
+  Logger.log('JOB:   ' + (rawJ ? rawJ : 'null'));
+}
+
+// ==================================
+// ---------------- V2: streaming job processor ----------------
+
+function makeOutputBaseV2_(csvName) {
+  const base = csvName.replace(/\.csv$/i,'');
+  return base + '.parced'; // keep familiar suffix
+}
+
+function processJobStreamingV2_(job) {
+  const parent = DriveApp.getFolderById(DRIVE_FOLDER_ID);
+  const outFolder = ensureFolder(parent, OUTPUT_SUBFOLDER_V2);
+
+  const file = DriveApp.getFileById(job.fileId);
+  const lines = readCsvLinesReliably_(file);
+  if (lines.length === 0) {
+    clearJobV2_();
+    logRun_('empty', job.fileName, '', 0, 0, 'skip','');
+    return;
+  }
+
+  GLOBAL_CURRENT_FILE_NAME = job.fileName; // for bad-line stamping
+  Logger.log('Input lines (incl header): ' + lines.length);
+
+  // optional visibility
+  logRun_('part_start', job.fileName, job.partIndex, '', '', 'ok', formatCET(new Date()));
+
+  const table = parseLinesToTable(lines, { fileName: job.fileName });
+  Logger.log('Parsed rows (incl header): ' + table.length);
+
+  if (!job.totalRows || !job.totalCols) {
+    job.totalRows = table.length;
+    job.totalCols = table[0].length;
+  }
+  const header = [table[0]];
+  const totalDataRows = job.totalRows - 1;
+
+  const rowsAllowed = Math.floor(SHEET_CELL_LIMIT / job.totalCols);
+  const dataRowsAllowedByCellCap = Math.max(1, rowsAllowed - 1);
+  const dataRowsAllowedByPolicy = AUTO_SPLIT_CHUNK_ROWS;
+
+  let remainingThisRun = MAX_WRITE_ROWS_PER_RUN;
+
+  while (job.dataCursor < totalDataRows && remainingThisRun > 0) {
+    const dataLeft = totalDataRows - job.dataCursor;
+    const partDataRows = Math.min(dataLeft, remainingThisRun, dataRowsAllowedByPolicy, dataRowsAllowedByCellCap);
+
+    // ---- Idempotent guard: skip if this part already exists ----
+    const xlsxName = job.outputBase + '__part' + String(job.partIndex).padStart(2, '0') + '.xlsx';
+    if (outFolder.getFilesByName(xlsxName).hasNext()) {
+      job.dataCursor += partDataRows;
+      logRun_('part_skip_exists', job.fileName, job.partIndex, partDataRows, totalDataRows, 'ok', '');
+      job.partIndex += 1;
+      remainingThisRun -= partDataRows;
+      saveJobV2_(job);
+      continue;
+    }
+    // ------------------------------------------------------------
+
+    const tempName = job.outputBase + '__part' + String(job.partIndex).padStart(2, '0');
+    precleanChunkArtifacts_(outFolder, tempName);
+
+    const tmp = SpreadsheetApp.create(tempName);
+    moveFileToFolder(DriveApp.getFileById(tmp.getId()), outFolder);
+    const sh = tmp.getSheets()[0]; sh.setName('Parsed');
+    sh.getRange(1,1,1,job.totalCols).setValues(header);
+
+    let written = 0;
+    while (written < partDataRows) {
+      const size = Math.min(WRITE_CHUNK_ROWS, partDataRows - written);
+      const startIdx = 1 + job.dataCursor + written;
+      const slice = table.slice(startIdx, startIdx + size);
+      sh.getRange(2 + written, 1, slice.length, job.totalCols).setValues(slice);
+      written += size;
+      SpreadsheetApp.flush();
+    }
+
+    exportSpreadsheetToXlsx_(tmp.getId(), outFolder, tempName + '.xlsx');
+    trashFile_(tmp.getId());
+    forceTrashIfExistsByName_(outFolder, tempName);
+
+    job.dataCursor += partDataRows;
+    logRun_('part_done', job.fileName, job.partIndex, partDataRows, totalDataRows, 'ok','');
+    logProgress_(job.fileName, job.partIndex, job.dataCursor, totalDataRows, 'running','');
+
+    job.partIndex += 1;
+    remainingThisRun -= partDataRows;
+    saveJobV2_(job);
+  }
+
+  if (job.dataCursor >= totalDataRows) {
+    clearJobV2_();
+    logRun_('file_complete', job.fileName, '', job.dataCursor, totalDataRows, 'ok','');
+    logProgress_(job.fileName, 0, totalDataRows, totalDataRows, 'completed','');
+    return;
+  }
+
+  // schedule next part (same file)
+  scheduleResumeAt_(BETWEEN_PARTS_DELAY_MIN, 'resume_all_v2_safe');
+  const nextAt = new Date(Date.now()+BETWEEN_PARTS_DELAY_MIN*60*1000);
+  logRun_('part_pause', job.fileName, job.partIndex, job.dataCursor, totalDataRows, 'pause', formatCET(nextAt));
+  logProgress_(job.fileName, job.partIndex, job.dataCursor, totalDataRows, 'paused','next part scheduled');
+}
+
+function safeParseTs_(s) {
+  if (!s) return null;
+  var t = String(s).trim();
+  var d = new Date(t);
+  if (isNaN(d.getTime())) {
+    // common fallback: "YYYY-MM-DD HH:MM:SS" → ISO
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(t)) {
+      d = new Date(t.replace(' ', 'T') + 'Z');
+    }
+  }
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// SAFE entrypoint for triggers. Use this as the trigger handler.
+function resume_all_v2_safe() {
+  try {
+    logRun_('resume_tick', '', '', '', '', 'ok', formatCET(new Date()));
+    resume_all_v2();
+  } catch (e) {
+    logRun_('resume_error', '', '', '', '', 'error: ' + (e && e.message || e), formatCET(new Date()));
+    scheduleResumeAt_(3, 'resume_all_v2_safe');
+  }
+}
+
+// ==================================
+// -------------- Watchdog (self-healing) --------------
+
+// One-time setup: creates a trigger that calls watchdog_v2 every 10 minutes.
+function install_watchdog_v2() {
+  // remove existing watchdog triggers to avoid duplicates
+  const ts = ScriptApp.getProjectTriggers();
+  for (let i = 0; i < ts.length; i++) {
+    if (ts[i].getHandlerFunction && ts[i].getHandlerFunction() === 'watchdog_v2') {
+      ScriptApp.deleteTrigger(ts[i]);
+    }
+  }
+  ScriptApp.newTrigger('watchdog_v2').timeBased().everyMinutes(10).create();
+  logRun_('watchdog_installed', '', '', '', '', 'ok', formatCET(new Date()));
+}
+
+// Runs every 10 minutes. If the queue/job is not finished and no resume trigger exists,
+// it re-arms a resume in 1 minute and logs it.
+function watchdog_v2() {
+  try {
+    const rawQ = PropertiesService.getScriptProperties().getProperty(JOB_QUEUE_KEY_V2);
+    const rawJ = PropertiesService.getScriptProperties().getProperty(JOB_KEY_V2);
+    const queue = rawQ ? JSON.parse(rawQ) : null;
+    const job   = rawJ ? JSON.parse(rawJ) : null;
+
+    if (!queue || !queue.items || queue.idx >= queue.items.length) {
+      logRun_('watchdog_ok', '', '', '', '', 'idle', formatCET(new Date()));
+      return;
+    }
+
+    // check if a resume trigger exists
+    let hasResume = false;
+    const ts = ScriptApp.getProjectTriggers();
+    for (let i = 0; i < ts.length; i++) {
+      const fn = ts[i].getHandlerFunction && ts[i].getHandlerFunction();
+      if (fn === 'resume_all_v2_safe') { hasResume = true; break; }
+    }
+
+    if (!hasResume) {
+      scheduleResumeAt_(1, 'resume_all_v2_safe');
+      logRun_('watchdog_rescheduled', (job && job.fileName) || '', (job && job.partIndex) || '', '', '', 'ok', formatCET(new Date()));
+    } else {
+      logRun_('watchdog_ok', (job && job.fileName) || '', (job && job.partIndex) || '', '', '', 'ok', formatCET(new Date()));
+    }
+  } catch (e) {
+    logRun_('watchdog_error', '', '', '', '', 'error: ' + (e && e.message || e), formatCET(new Date()));
+  }
+}
+
+function cleanup_triggers_v2() {
+  const keep = new Set(); // keep none; or add names to keep: keep.add('watchdog_v2')
+  const ts = ScriptApp.getProjectTriggers();
+  let removed = 0;
+  for (let i = 0; i < ts.length; i++) {
+    const fn = ts[i].getHandlerFunction && ts[i].getHandlerFunction();
+    if (!keep.has(fn) && (fn === 'resume_all_v2_safe' || fn === 'watchdog_v2')) {
+      ScriptApp.deleteTrigger(ts[i]);
+      removed++;
+    }
+  }
+  logRun_('cleanup_triggers', '', '', '', '', 'ok (removed ' + removed + ')', formatCET(new Date()));
 }
