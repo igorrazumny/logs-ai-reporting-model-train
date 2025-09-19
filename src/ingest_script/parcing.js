@@ -1,7 +1,59 @@
 // File: drive_month_xlsx_only_shared_drive.gs
-// Parse one month per run; EXPORT XLSX ONLY; Shared Drive compatible.
-// v1: single-file runner kept for backward-compat.
-// v2: folder-wide runner with unprocessed-line sink + live logging.
+//
+// PURPOSE
+// =======
+// Robust Google Apps Script to parse very large, pipe-delimited CSV audit logs that live in a
+// Shared Drive, normalize them, and export the results **only as XLSX files** in deterministic,
+// bounded-size parts. The script supports two modes:
+//
+//   v1 (month/range runner):
+//     - Manually process a single month or a contiguous range of months.
+//     - Streams rows into temporary Google Sheets in bounded blocks, exports each to XLSX,
+//       then deletes the temporary Sheet to avoid Google Sheets cell limits.
+//     - Fully resumable via Script Properties + a time-based trigger.
+//
+//   v2 (folder-wide runner):
+//     - Queues every CSV in the folder and processes newest first.
+//     - Adds a persistent “bad-lines” sink for unparseable rows and a live “execution log” workbook.
+//     - Self-heals via a watchdog trigger that re-arms the resume trigger if needed.
+//     - Idempotent per-part export: if a part’s XLSX already exists, that part is skipped.
+//
+// KEY DESIGN CONSTRAINTS
+// ======================
+// • Shared Drive compatible (uses DriveApp with supportsAllDrives where needed).
+// • No single Google Sheet can exceed Google’s cell limits; all writing is chunked.
+// • Export target is strictly XLSX; no Google Sheets kept except the logbooks and transient temps.
+// • Resumability: job and queue states stored in Script Properties.
+// • Idempotency: v2 will not re-create an XLSX part if it already exists.
+// • Robustness: converts CSV via Drive API first; falls back to ranged downloads if too large.
+//
+// FOLDER STRUCTURE (under DRIVE_FOLDER_ID)
+// =======================================
+// • CSVs are read directly from the parent folder.
+// • v1 outputs XLSX parts into OUTPUT_SUBFOLDER.
+// • v2 outputs:
+//     - XLSX parts into OUTPUT_SUBFOLDER_V2
+//     - bad/unprocessed lines into BADLINES_SUBFOLDER_V2 (rolling workbooks)
+//     - execution logbook into LOGS_SUBFOLDER_V2 (sheets: 'runs', 'progress')
+//
+// TRIGGERS
+// ========
+// • v1: scheduleResume_() creates a time-based trigger to call resume_current_job().
+// • v2: scheduleResumeAt_() creates a time-based trigger to call resume_all_v2_safe().
+// • Watchdog: install_watchdog_v2() installs watchdog_v2() every 10 minutes.
+//
+// PARSER OVERVIEW
+// ===============
+// • Input lines are pipe-delimited with CSV-like quoting and "" escaping.
+// • Records are normalized to exactly 9 base columns, then enriched with derived fields:
+//   recipe_id, recipe_name, material_name, material_id, name1, name2, username, action,
+//   session_start, session_end, session_duration.
+// • Session pairing: “checked out recipe …” starts a session; “checked in … / discarded checkout /
+//   updated recipe / auto-check in” ends a session. Durations are bounded for outliers.
+//
+// =================================================================================================
+// ======================================= CONFIG & CONSTANTS =======================================
+// =================================================================================================
 
 // ========= REQUIRED CONFIG (v1) =========
 const DRIVE_FOLDER_ID = '1GDJifQIErKsKwUuQta2ILXmVyvOSiEk6';
@@ -45,18 +97,29 @@ const JOB_QUEUE_KEY_V2 = 'LOGS_XLSX_JOB_QUEUE_V2';
 var GLOBAL_CURRENT_FILE_NAME = '';  // set by v2 processor to stamp bad-lines
 
 // ---------- Time formatting (CET/CEST) ----------
+/**
+ * Formats a Date into CET/CEST string "yyyy-MM-dd HH:mm:ss z".
+ * Used for logs so all timestamps are local to Europe/Zurich.
+ */
 function formatCET(d) {
   return Utilities.formatDate(d, 'Europe/Zurich', "yyyy-MM-dd HH:mm:ss z");
 }
 
-// ==================================
-// ---------------- Public: v1 month runners ----------------
+// =================================================================================================
+// ======================================= PUBLIC: v1 RUNNERS =======================================
+// =================================================================================================
 
+/**
+ * v1 entry: process a single month (YYYY, M) by delegating to run_range().
+ * @param {number} year
+ * @param {number} month 1–12
+ */
 function run_month(year, month) {
   const ym = String(year) + '-' + ('0' + Number(month)).slice(-2);
   run_range(ym, ym);
 }
 
+// Convenience wrappers for fixed months (handy to use as trigger handlers)
 function run_2021_08(){ run_month(2021,8); }
 function run_2021_09(){ run_month(2021,9); }
 function run_2021_10(){ run_month(2021,10); }
@@ -111,7 +174,10 @@ function run_2025_06(){ run_month(2025,6); }
 function run_2025_07(){ run_month(2025,7); }
 function run_2025_08(){ run_month(2025,8); }
 
-// Manual resume (v1)
+/**
+ * v1 manual resume entry point. Used by v1’s time-based trigger.
+ * Loads job from Script Properties and calls processJobStreaming_().
+ */
 function resume_current_job() {
   const job = loadJob_();
   if (!job) { Logger.log('No active job.'); return; }
@@ -119,9 +185,16 @@ function resume_current_job() {
   processJobStreaming_(job);
 }
 
-// ---------------- Public: v2 folder-wide runners ----------------
+// =================================================================================================
+// ======================================= PUBLIC: v2 RUNNERS =======================================
+// =================================================================================================
 
-// Parse YYYY/MM from name (newest-first sorting)
+/**
+ * Attempts to parse a year-month from a filename for sorting priority.
+ * Accepts "Month YYYY" or "YYYY[-_ ]MM" variants. Case-insensitive months.
+ * @param {string} name CSV filename
+ * @return {{y:number,m:number}|null}
+ */
 function parseYearMonthFromName_(name) {
   const MONTHS = {january:1,february:2,march:3,april:4,may:5,june:6,
                   july:7,august:8,september:9,october:10,november:11,december:12};
@@ -133,7 +206,10 @@ function parseYearMonthFromName_(name) {
   return null;
 }
 
-// Queues ALL CSVs and starts with the newest first
+/**
+ * v2 entry: builds a queue of all CSV files in the folder and starts processing newest first.
+ * Stores the queue in Script Properties, clears any stale v2 job, and calls resume_all_v2().
+ */
 function run_all_v2() {
   const parent = DriveApp.getFolderById(DRIVE_FOLDER_ID);
   const items = [];
@@ -145,6 +221,7 @@ function run_all_v2() {
     const ym = parseYearMonthFromName_(name);
     items.push({id:f.getId(), name:name, ym:ym});
   }
+  // Newest first: by year, then month, then name desc. Unknown dates go last.
   items.sort(function(a,b){
     if (a.ym && b.ym) {
       if (a.ym.y !== b.ym.y) return b.ym.y - a.ym.y;
@@ -160,7 +237,12 @@ function run_all_v2() {
   resume_all_v2();
 }
 
-// Resumes v2 (called by trigger or manually). Handles between-parts and between-files scheduling.
+/**
+ * v2 main loop (resumable). Ensures output/log/badlines folders exist,
+ * acquires current queue item or creates a new job, runs processJobStreamingV2_(),
+ * then advances to the next file with a delay. Writes live logs to the logbook.
+ * Safe to call manually or via the resume_all_v2_safe() trigger.
+ */
 function resume_all_v2() {
   // heartbeat so we see every wake-up
   logRun_('resume_tick', '', '', '', '', 'ok', formatCET(new Date()));
@@ -210,9 +292,15 @@ function resume_all_v2() {
   }
 }
 
-// ==================================
-// ---------------- Backfill helpers (v1 unchanged) ----------------
+// =================================================================================================
+// ======================================= BACKFILL HELPERS (v1) ====================================
+// =================================================================================================
 
+/**
+ * Scans OUTPUT_SUBFOLDER for legacy ".parced" Google Sheets and exports each to XLSX
+ * if an XLSX doesn’t already exist. Useful when migrating older artifacts to XLSX-only.
+ * Requires Advanced Drive.
+ */
 function export_all_existing_parced_to_xlsx() {
   assertAdvancedDrive_();
   const parent = DriveApp.getFolderById(DRIVE_FOLDER_ID);
@@ -238,6 +326,11 @@ function export_all_existing_parced_to_xlsx() {
   Logger.log('Done. Created XLSX: ' + made + ', skipped: ' + skipped);
 }
 
+/**
+ * For each legacy ".parced" Google Sheet, exports in chunked XLSX parts of `chunkSize` rows.
+ * Ensures temp artifacts are cleaned per part.
+ * @param {number} chunkSize number of data rows per part
+ */
 function export_all_existing_parced_to_xlsx_in_chunks(chunkSize) {
   assertAdvancedDrive_();
   const parent = DriveApp.getFolderById(DRIVE_FOLDER_ID);
@@ -261,9 +354,14 @@ function export_all_existing_parced_to_xlsx_in_chunks(chunkSize) {
   Logger.log('Done. Chunk-exported sheets: ' + made);
 }
 
-// ==================================
-// ---------------- Core range runner (v1, streams parts; resumable) ----------------
-
+// =================================================================================================
+/**
+ * v1 core range runner: finds CSVs whose inferred YYYY-MM are between [fromYMonth, toYMonth],
+ * sorted ascending, then streams each into XLSX parts via processJobStreaming_().
+ * Resumable mid-file via Script Properties.
+ * @param {string} fromYMonth "YYYY-MM"
+ * @param {string} toYMonth   "YYYY-MM"
+ */
 function run_range(fromYMonth, toYMonth) {
   const t0 = new Date();
   Logger.log('Range start: ' + fromYMonth + ' → ' + toYMonth);
@@ -339,9 +437,19 @@ function run_range(fromYMonth, toYMonth) {
   Logger.log('Range handler finished. Elapsed: ' + Math.round((t1 - t0)/1000) + 's');
 }
 
-// ==================================
-// ---------------- Streaming job processor (v1) ----------------
+// =================================================================================================
+// ============================= STREAMING PROCESSOR (v1, XLSX-only) ===============================
+// =================================================================================================
 
+/**
+ * v1 streaming writer for a single CSV file. Converts CSV→table, then repeatedly:
+ * - creates a temp Sheet for the next part
+ * - writes header + a bounded number of data rows in WRITE_CHUNK_ROWS blocks
+ * - exports to XLSX
+ * - deletes temp artifacts
+ * Persists job state after each part for resumability.
+ * @param {{fileId:string,outputBase:string,totalRows:number,totalCols:number,dataCursor:number,partIndex:number}} job
+ */
 function processJobStreaming_(job) {
   const parent = DriveApp.getFolderById(DRIVE_FOLDER_ID);
   const outFolder = ensureSubfolder(parent, OUTPUT_SUBFOLDER);
@@ -418,15 +526,27 @@ function processJobStreaming_(job) {
   }
 }
 
-// ==================================
-// ---------------- Helpers (folders, trash, IO) ----------------
+// =================================================================================================
+// ==================================== HELPERS (folders, IO) ======================================
+// =================================================================================================
 
+/**
+ * Get or create a subfolder by name under a parent folder.
+ * @param {GoogleAppsScript.Drive.Folder} parent
+ * @param {string} name
+ * @return {GoogleAppsScript.Drive.Folder}
+ */
 function ensureSubfolder(parent, name) {
   const it = parent.getFoldersByName(name);
   return it.hasNext() ? it.next() : parent.createFolder(name);
 }
+/** Alias kept for readability parity. */
 function ensureFolder(parent, name) { return ensureSubfolder(parent, name); }
 
+/**
+ * Moves a file into the given folder, removing any other parents.
+ * This is Shared Drive safe (DriveApp).
+ */
 function moveFileToFolder(file, folder) {
   folder.addFile(file);
   const parents = file.getParents();
@@ -436,18 +556,29 @@ function moveFileToFolder(file, folder) {
   }
 }
 
+/**
+ * Normalizes newlines and splits to non-empty lines.
+ * Note: not used in main flow (we rely on Drive conversion / ranged fetch).
+ */
 function splitLines_(s) {
   return s.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
           .split('\n').filter(function (x) { return x !== '' });
 }
 
+/**
+ * Ensures the Advanced Drive service is enabled for this script project.
+ * Throws a descriptive error if not enabled.
+ */
 function assertAdvancedDrive_() {
   if (typeof Drive === 'undefined' || !Drive.Files) {
     throw new Error('Advanced Drive Service not enabled. In Script Editor: Services → “+” → add Drive API.');
   }
 }
 
-// DriveApp-only trash (quiet, Shared Drives OK)
+/**
+ * Soft-delete a file by ID with retries. Uses DriveApp.setTrashed(true),
+ * which works in Shared Drives. Swallows errors after max retries, but logs.
+ */
 function trashFile_(fileId) {
   const maxTries = 3;
   let wait = 300;
@@ -466,6 +597,10 @@ function trashFile_(fileId) {
   }
 }
 
+/**
+ * Force-delete any file(s) in the folder that exactly match the given name.
+ * Used to clean temp artifacts that may have been left if an execution aborted.
+ */
 function forceTrashIfExistsByName_(folder, exactName) {
   const it = folder.getFilesByName(exactName);
   while (it.hasNext()) {
@@ -475,6 +610,10 @@ function forceTrashIfExistsByName_(folder, exactName) {
   }
 }
 
+/**
+ * Pre-cleans any temporary Google Sheets whose names start with outBaseName+"__part".
+ * This avoids collisions before a new export attempt.
+ */
 function precleanChunkArtifacts_(folder, outBaseName) {
   forceTrashIfExistsByName_(folder, outBaseName);
   const it = folder.getFiles();
@@ -488,8 +627,19 @@ function precleanChunkArtifacts_(folder, outBaseName) {
   }
 }
 
-// -------- CSV reading (convert first, chunked download fallback) --------
+// =================================================================================================
+// ========================= CSV READING (convert-first, ranged fallback) ===========================
+// =================================================================================================
 
+/**
+ * Reads a CSV (Drive file) into an array of raw text lines robustly.
+ * Preferred path: Drive.Files.copy(..., convert:true) to Google Sheet, then read column A.
+ * If file is too large (413) or conversion fails after retries, falls back to byte-range downloads.
+ * Always cleans up the temp converted Sheet (trashed).
+ * Requires Advanced Drive.
+ * @param {GoogleAppsScript.Drive.File} file
+ * @return {string[]} lines
+ */
 function readCsvLinesReliably_(file) {
   assertAdvancedDrive_();
 
@@ -549,6 +699,12 @@ function readCsvLinesReliably_(file) {
   return readCsvByChunkedDownload_(file.getId());
 }
 
+/**
+ * Byte-range downloads a CSV file and reassembles clean lines.
+ * Preserves a final carry-over between chunks to avoid splitting lines mid-byte range.
+ * @param {string} fileId
+ * @return {string[]} lines
+ */
 function readCsvByChunkedDownload_(fileId) {
   const token = ScriptApp.getOAuthToken();
   const base = 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fileId) + '?alt=media&supportsAllDrives=true';
@@ -589,8 +745,18 @@ function readCsvByChunkedDownload_(fileId) {
   return lines;
 }
 
-// ---------------- XLSX export helpers ----------------
+// =================================================================================================
+// ===================================== XLSX EXPORT HELPERS =======================================
+// =================================================================================================
 
+/**
+ * Exports a Google Spreadsheet (by ID) to XLSX into the given folder, overwriting by name.
+ * Uses Drive.Files.export first; falls back to Drive v3 REST URL if needed.
+ * Requires Advanced Drive.
+ * @param {string} ssId Spreadsheet ID
+ * @param {GoogleAppsScript.Drive.Folder} outFolder
+ * @param {string} xlsxName
+ */
 function exportSpreadsheetToXlsx_(ssId, outFolder, xlsxName) {
   assertAdvancedDrive_();
 
@@ -616,6 +782,14 @@ function exportSpreadsheetToXlsx_(ssId, outFolder, xlsxName) {
   outFolder.createFile(blob).setName(xlsxName);
 }
 
+/**
+ * Exports a single Google Sheet into multiple XLSX parts of `chunkSize` rows.
+ * Writes header to each part, then appends a slice of rows, exports, and cleans temp.
+ * @param {string} ssId
+ * @param {GoogleAppsScript.Drive.Folder} outFolder
+ * @param {string} outBaseName
+ * @param {number} chunkSize
+ */
 function exportSheetToXlsxInChunks_(ssId, outFolder, outBaseName, chunkSize) {
   assertAdvancedDrive_();
 
@@ -663,11 +837,24 @@ function exportSheetToXlsxInChunks_(ssId, outFolder, outBaseName, chunkSize) {
   }
 }
 
-// ==================================
-// -------------- Parsing + session logic --------------
+// =================================================================================================
+// ================================== PARSING & SESSION LOGIC ======================================
+// =================================================================================================
 
-// v2-compatible parser: tries to normalize; if impossible and a badSink is provided,
-// the raw line is appended to the bad-lines GSheet and the row is skipped.
+/**
+ * Converts raw CSV lines to a normalized 2D table with derived fields and session metadata.
+ * If `badSink` is provided, malformed rows are appended to the bad-lines workbook and skipped.
+ * Output schema:
+ *   base 9 fields: [User ID, ID, Subseq ID, Message, Audit Time, Action, Type, Label, Version]
+ *   + derived fields:
+ *     recipe_id, recipe_name, material_name, material_id,
+ *     name1, name2, username, action,
+ *     session_start, session_end, session_duration
+ * Session pairing is applied in a second pass.
+ * @param {string[]} lines
+ * @param {{fileName:string}|null} badSink
+ * @return {Array<Array<string>>} table (first row is header)
+ */
 function parseLinesToTable(lines, badSink) {
   const rawHeader = lines[0].split('|').map(function (s) { return s.trim(); });
   const header = rawHeader.map(function (h) { return h.replace(/\s+/g, '_').replace(/[^\w]/g, '').toLowerCase(); });
@@ -771,8 +958,12 @@ function parseLinesToTable(lines, badSink) {
   return out;
 }
 
-// ===== parser helpers (no defaults) =====
+// ---------------------------------- Parser helpers ----------------------------------
 
+/**
+ * Splits "Firstname Lastname (username)" into structured parts.
+ * Returns {name1, name2, username}. If no space, name2 is empty.
+ */
 function splitUser_(userIdRaw) {
   const m = String(userIdRaw).match(/^(.*?)(?:\s*\(([^)]+)\))?\s*$/);
   const namePart = m && m[1] ? m[1].trim() : String(userIdRaw).trim();
@@ -782,6 +973,11 @@ function splitUser_(userIdRaw) {
   const name2 = i === -1 ? ''       : namePart.slice(i + 1).trim();
   return { name1: name1, name2: name2, username: username };
 }
+
+/**
+ * Extracts Recipe ID from message with several tolerant patterns.
+ * Returns empty string if not found.
+ */
 function extractRecipeId_(msg) {
   const s = String(msg);
   let m = s.match(/Recipe ID:\s*'([^']+)'/i);
@@ -792,15 +988,22 @@ function extractRecipeId_(msg) {
   if (m) return m[0].trim();
   return '';
 }
+
+/** Extracts "Material Name = X" from message (up to next pipe). */
 function extractMaterialName_(msg) {
   const m = String(msg).match(/Material Name\s*=\s*([^|]+)/i);
   return m ? m[1].trim() : '';
 }
+/** Extracts numeric "Material ID = 123" from message. */
 function extractMaterialId_(msg) {
   const m = String(msg).match(/Material ID\s*=\s*([0-9]+)/i);
   return m ? m[1].trim() : '';
 }
+
+/** True if message denotes a session start (checkout). */
 function isStart_(msg) { return /(^|\s)checked out recipe\b/i.test(String(msg)); }
+
+/** True if message denotes a session end. Includes multiple end-like events. */
 function isEnd_(msg) {
   const s = String(msg);
   return /(^|\s)checked in recipe\b/i.test(s)
@@ -808,14 +1011,24 @@ function isEnd_(msg) {
       || /(^|\s)updated recipe\b/i.test(s)
       || /(^|\s)auto-check in\b/i.test(s);
 }
+
+/** True if message denotes an automatic check-in (caps session duration). */
 function isAutoCheckIn_(msg) { return /(^|\s)auto-check in\b/i.test(String(msg)); }
+
+/**
+ * Builds a session key combining user identity and recipe identity.
+ * The key groups starts/ends for pairing in pass 2.
+ */
 function makeKey_(username, userIdRaw, recipeId, recipeName) {
   const who = username || String(userIdRaw);
   const what = recipeId || recipeName || '';
   return who + '|' + what;
 }
 
-// Split a pipe-delimited line with CSV-like quotes and "" escaping.
+/**
+ * Splits a pipe-delimited line with CSV-like quotes and "" escaping.
+ * Ensures that pipes inside quotes do not split the field.
+ */
 function splitPipesQuoted(line) {
   const out = []; let cur = ''; let inQ = false;
   for (let i = 0; i < line.length; i++) {
@@ -833,7 +1046,13 @@ function splitPipesQuoted(line) {
   return out;
 }
 
-// Expect 9 fields. If >9, merge extras back into Message; if <9, pad.
+/**
+ * Coerces a row to exactly 9 fields.
+ * If >9 fields, merges the extras back into the Message field.
+ * If <9 fields, pads with empty strings.
+ * @param {string[]} cells
+ * @return {{ok:boolean, cols:string[], reason:string}}
+ */
 function tryToNine_(cells) {
   if (cells.length === 9) return { ok:true, cols:cells, reason:'' };
   if (cells.length > 9) {
@@ -850,19 +1069,27 @@ function tryToNine_(cells) {
   return { ok:true, cols:padded, reason:'PADDED' };
 }
 
-// ==================================
-// ---------------- Job persistence & auto-resume (v1) ----------------
+// =================================================================================================
+// ============================== JOB PERSISTENCE & AUTO-RESUME (v1) ===============================
+// =================================================================================================
 
+/** Persists v1 job to Script Properties. */
 function saveJob_(job) {
   PropertiesService.getScriptProperties().setProperty(JOB_KEY, JSON.stringify(job));
 }
+/** Loads v1 job from Script Properties, or null. */
 function loadJob_() {
   const raw = PropertiesService.getScriptProperties().getProperty(JOB_KEY);
   return raw ? JSON.parse(raw) : null;
 }
+/** Clears v1 job from Script Properties. */
 function clearJob_() {
   PropertiesService.getScriptProperties().deleteProperty(JOB_KEY);
 }
+/**
+ * Ensures a single time-based trigger exists for v1 resume.
+ * Deletes stale triggers for the same handler before creating a fresh one.
+ */
 function scheduleResume_() {
   const triggers = ScriptApp.getProjectTriggers();
   for (var i = 0; i < triggers.length; i++) {
@@ -874,14 +1101,23 @@ function scheduleResume_() {
   ScriptApp.newTrigger('resume_current_job').timeBased().after(AUTORETRY_MINUTES * 60 * 1000).create();
 }
 
-// ==================================
-// ---------------- V2: persistence, scheduling, logging, bad-lines  ----------------
+// =================================================================================================
+// ==================== V2 PERSISTENCE, SCHEDULING, LOGGING, BAD-LINES ==============================
+// =================================================================================================
 
+/** Persists v2 job. */
 function saveJobV2_(job){ PropertiesService.getScriptProperties().setProperty(JOB_KEY_V2, JSON.stringify(job)); }
+/** Loads v2 job or null. */
 function loadJobV2_(){ const raw=PropertiesService.getScriptProperties().getProperty(JOB_KEY_V2); return raw?JSON.parse(raw):null; }
+/** Clears v2 job. */
 function clearJobV2_(){ PropertiesService.getScriptProperties().deleteProperty(JOB_KEY_V2); }
 
-// robust trigger creator with logging (CET)
+/**
+ * Creates a time-based trigger to run a handler at a future time (or after delay),
+ * first removing any existing triggers for that handler. Logs the action in the logbook.
+ * @param {number} minutes delay in minutes
+ * @param {string} handler handler function name
+ */
 function scheduleResumeAt_(minutes, handler) {
   const whenMs = minutes * 60 * 1000;
   const eta = new Date(Date.now() + whenMs);
@@ -909,6 +1145,11 @@ function scheduleResumeAt_(minutes, handler) {
   }
 }
 
+/**
+ * Returns (or creates) the execution logbook spreadsheet with sheets:
+ *  - 'runs'     : append-only event log
+ *  - 'progress' : single-row current status for easy monitoring
+ */
 function getLogBook_() {
   const parent = DriveApp.getFolderById(DRIVE_FOLDER_ID);
   const logsFolder = ensureFolder(parent, LOGS_SUBFOLDER_V2);
@@ -922,6 +1163,10 @@ function getLogBook_() {
   progress.getRange(1,1,1,7).setValues([['ts','current_file','part','cursor','total_rows','status','note']]);
   return ss;
 }
+
+/**
+ * Appends a structured log entry to the 'runs' sheet of the logbook.
+ */
 function logRun_(phase, fileName, part, rowsWritten, totalRows, status, nextResumeAt) {
   const ss = getLogBook_();
   ss.getSheetByName('runs').appendRow([
@@ -930,6 +1175,10 @@ function logRun_(phase, fileName, part, rowsWritten, totalRows, status, nextResu
     nextResumeAt ? (typeof nextResumeAt === 'string' ? nextResumeAt : formatCET(nextResumeAt)) : ''
   ]);
 }
+
+/**
+ * Updates the single-line 'progress' sheet with current status.
+ */
 function logProgress_(fileName, part, cursor, total, status, note) {
   const ss = getLogBook_();
   const sh = ss.getSheetByName('progress');
@@ -939,6 +1188,11 @@ function logProgress_(fileName, part, cursor, total, status, note) {
   ]]);
 }
 
+/**
+ * Returns (or creates) the "bad lines" workbook. Rolls over when max rows is reached,
+ * appending a timestamp suffix to the workbook name.
+ * @param {string} rollSuffix optional timestamp suffix (managed internally)
+ */
 function getBadLinesBook_(rollSuffix) {
   const parent = DriveApp.getFolderById(DRIVE_FOLDER_ID);
   const badFolder = ensureFolder(parent, BADLINES_SUBFOLDER_V2);
@@ -951,6 +1205,11 @@ function getBadLinesBook_(rollSuffix) {
   sh.appendRow(['file','orig_line_no','raw_line','reason']);
   return ss;
 }
+
+/**
+ * Appends a single malformed input line into the current bad-lines workbook,
+ * rolling over to a new workbook when BADLINES_MAX_ROWS is reached.
+ */
 function appendBadLine_(fileName, lineNo, raw, reason) {
   let ss = getBadLinesBook_('');
   let sh = ss.getSheets()[0];
@@ -962,11 +1221,15 @@ function appendBadLine_(fileName, lineNo, raw, reason) {
   sh.appendRow([fileName, String(lineNo), raw, reason || 'NOT_PROCESSED']);
 }
 
-// handy debug helpers
+// ---------------------------------- v2 debug helpers ----------------------------------
+
+/** Lists current time-based triggers for quick inspection in Logs. */
 function v2_list_triggers() {
   const ts = ScriptApp.getProjectTriggers().map(function(t){ return {fn:t.getHandlerFunction(), type:'timeBased'}; });
   Logger.log(JSON.stringify(ts));
 }
+
+/** Dumps current queue and job JSON from Script Properties into Logs. */
 function v2_debug_status() {
   const rawQ = PropertiesService.getScriptProperties().getProperty(JOB_QUEUE_KEY_V2);
   const rawJ = PropertiesService.getScriptProperties().getProperty(JOB_KEY_V2);
@@ -974,14 +1237,26 @@ function v2_debug_status() {
   Logger.log('JOB:   ' + (rawJ ? rawJ : 'null'));
 }
 
-// ==================================
-// ---------------- V2: streaming job processor ----------------
+// =================================================================================================
+// ============================ V2 STREAMING PROCESSOR (idempotent) ================================
+// =================================================================================================
 
+/**
+ * Builds the base output name for a CSV in v2 (keeps ".parced" for familiarity).
+ * @param {string} csvName
+ * @return {string}
+ */
 function makeOutputBaseV2_(csvName) {
   const base = csvName.replace(/\.csv$/i,'');
   return base + '.parced'; // keep familiar suffix
 }
 
+/**
+ * v2 streaming writer with idempotent per-part XLSX export and live logging.
+ * If an XLSX part already exists, that part is skipped and the cursor advances accordingly.
+ * Writes progress and run logs, and schedules next part/file via scheduleResumeAt_().
+ * @param {{fileId:string,fileName:string,outputBase:string,totalRows:number,totalCols:number,dataCursor:number,partIndex:number}} job
+ */
 function processJobStreamingV2_(job) {
   const parent = DriveApp.getFolderById(DRIVE_FOLDER_ID);
   const outFolder = ensureFolder(parent, OUTPUT_SUBFOLDER_V2);
@@ -1077,6 +1352,10 @@ function processJobStreamingV2_(job) {
   logProgress_(job.fileName, job.partIndex, job.dataCursor, totalDataRows, 'paused','next part scheduled');
 }
 
+/**
+ * Parses a variety of timestamp shapes into a Date or returns null.
+ * Supports ISO-like strings and "YYYY-MM-DD HH:MM:SS" (treated as UTC).
+ */
 function safeParseTs_(s) {
   if (!s) return null;
   var t = String(s).trim();
@@ -1090,7 +1369,10 @@ function safeParseTs_(s) {
   return isNaN(d.getTime()) ? null : d;
 }
 
-// SAFE entrypoint for triggers. Use this as the trigger handler.
+/**
+ * Safe trigger entrypoint for v2: wraps resume_all_v2() with error logging and backoff re-arm.
+ * Use this function name as the time-based trigger handler.
+ */
 function resume_all_v2_safe() {
   try {
     logRun_('resume_tick', '', '', '', '', 'ok', formatCET(new Date()));
@@ -1101,10 +1383,14 @@ function resume_all_v2_safe() {
   }
 }
 
-// ==================================
-// -------------- Watchdog (self-healing) --------------
+// =================================================================================================
+// ========================================== WATCHDOG =============================================
+// =================================================================================================
 
-// One-time setup: creates a trigger that calls watchdog_v2 every 10 minutes.
+/**
+ * One-time installer for the v2 watchdog trigger (every 10 minutes).
+ * Removes any existing watchdog_v2 triggers to avoid duplicates.
+ */
 function install_watchdog_v2() {
   // remove existing watchdog triggers to avoid duplicates
   const ts = ScriptApp.getProjectTriggers();
@@ -1117,8 +1403,11 @@ function install_watchdog_v2() {
   logRun_('watchdog_installed', '', '', '', '', 'ok', formatCET(new Date()));
 }
 
-// Runs every 10 minutes. If the queue/job is not finished and no resume trigger exists,
-// it re-arms a resume in 1 minute and logs it.
+/**
+ * Runs every 10 minutes. If the v2 queue still has work and no resume trigger is present,
+ * arms a resume in 1 minute and logs. Otherwise logs “ok”.
+ * Errors are caught and logged, and do not throw.
+ */
 function watchdog_v2() {
   try {
     const rawQ = PropertiesService.getScriptProperties().getProperty(JOB_QUEUE_KEY_V2);
@@ -1150,6 +1439,11 @@ function watchdog_v2() {
   }
 }
 
+/**
+ * Utility to clean up v2-related triggers ("resume_all_v2_safe" and "watchdog_v2").
+ * Keeps none by default; edit the `keep` Set to preserve specific handlers.
+ * Writes an entry to the run log with how many were removed.
+ */
 function cleanup_triggers_v2() {
   const keep = new Set(); // keep none; or add names to keep: keep.add('watchdog_v2')
   const ts = ScriptApp.getProjectTriggers();

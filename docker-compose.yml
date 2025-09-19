@@ -6,7 +6,7 @@ services:
     container_name: ollama
     restart: unless-stopped
     ports:
-      - "11434:11434"
+      - "11434:11434"           # Ollama API (internal+external for now)
     volumes:
       - ollama:/root/.ollama
 
@@ -34,12 +34,17 @@ services:
       - LOAD_VERBOSE=1
       - LOAD_TICK_SEC=1
       - LOAD_PROGRESS_EVERY=500
+
+      # Streamlit default port
+      - STREAMLIT_PORT=8501
     volumes:
       - ./src:/app/src
       - ./data:/app/data
       - ./outputs:/app/outputs
       - ./adapters:/app/adapters
       - ./docs:/app/docs
+    ports:
+      - "8501:8501"             # Streamlit UI (reserved; becomes active once UI is added)
     depends_on:
       - ollama
 

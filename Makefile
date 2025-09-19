@@ -136,3 +136,19 @@ cold:
 	rm -f $(DB_PATH)
 	$(MAKE) restart
 	$(MAKE) ingest N=$(N)
+
+# Capture everything after "nlq" as the query text (handles spaces).
+NLQ_ARGS := $(wordlist 2,$(words $(MAKECMDGOALS)),$(MAKECMDGOALS))
+# Prevent make from treating those words as separate targets.
+$(NLQ_ARGS):
+	@:
+
+.PHONY: nlq
+nlq:
+	@if [ -z "$(NLQ_ARGS)" ]; then \
+		echo "Usage: make nlq <your question>"; \
+		echo "Example: make nlq Top users by count"; \
+		exit 1; \
+	fi; \
+	Q="$(NLQ_ARGS)"; \
+	docker compose exec app python -m src.nlp.nlsqlnl "$$Q"
