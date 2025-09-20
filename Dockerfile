@@ -24,6 +24,6 @@ COPY adapters/ ./adapters/
 COPY docs/ ./docs/
 COPY db/ ./db/
 COPY README.md LICENSE.txt ./
-ENV PYTHONPATH=/app/src:/app:/app/db
+ENV PYTHONPATH=/app:/app/src
 
 CMD ["python","-m","src.logs_train.cli","help"]
