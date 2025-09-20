@@ -1,18 +1,31 @@
-# Keep images small
+# Project: logs-ai-reporting-model-train — File: .dockerignore
+
+# Virtualenvs
 .venv/
+
+# Python cache
 __pycache__/
 *.pyc
 *.pyo
-*.log
+*.pyd
 
-# Big / private stuff
+# Logs / temp
+*.log
+*.tmp
+
+# Large / transient data
 data/
 models/
 outputs/
+backups/
 *.parquet
 *.jsonl
 *.csv
 
-# IDE
+# IDE / editor configs
 .idea/
 .vscode/
+
+# OS cruft
+.DS_Store
+Thumbs.db

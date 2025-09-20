@@ -27,14 +27,12 @@ services:
       - POSTGRES_PASSWORD=logsai_user_password
       - POSTGRES_DB=logsaidb
       - ADMIN_TOKEN=admin
+      - LLM_HOST=http://ollama:11434
+      - LLM_MODEL=llama3:8b     # other options: mixtral:8x7b / llama3:8b / mistral:7b / gemma:7b / qwen2:7b
     command: ["streamlit","run","src/web/app.py","--server.port=8501","--server.address=0.0.0.0"]
+    # One bind for the entire repo: any new folder is auto-visible (/app/*)
     volumes:
-      - ./src:/app/src
-      - ./db:/app/db
-      - ./data:/app/data
-      - ./outputs:/app/outputs
-      - ./adapters:/app/adapters
-      - ./docs:/app/docs
+      - .:/app
     ports:
       - "8501:8501"
     depends_on:
