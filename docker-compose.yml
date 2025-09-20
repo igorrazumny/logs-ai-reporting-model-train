@@ -27,6 +27,7 @@ services:
       - POSTGRES_PASSWORD=logsai_user_password
       - POSTGRES_DB=logsaidb
       - ADMIN_TOKEN=admin
+      - LLM_PROVIDER=ollama
       - LLM_HOST=http://ollama:11434
       - LLM_MODEL=llama3:8b     # other options: mixtral:8x7b / llama3:8b / mistral:7b / gemma:7b / qwen2:7b
     command: ["streamlit","run","src/ui/web/app.py","--server.port=8501","--server.address=0.0.0.0"]
