@@ -8,7 +8,7 @@ import streamlit as st
 
 from db.init_db import main as init_db_main
 from db.connection import get_connection
-from ingest.xlsx2db import list_staged_xlsx, ingest_file
+from db.ingest.xlsx2db import list_staged_xlsx, ingest_file
 
 UPLOAD_DIR = "/app/data/uploads"  # bind mount
 

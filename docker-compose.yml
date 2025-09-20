@@ -29,7 +29,7 @@ services:
       - ADMIN_TOKEN=admin
       - LLM_HOST=http://ollama:11434
       - LLM_MODEL=llama3:8b     # other options: mixtral:8x7b / llama3:8b / mistral:7b / gemma:7b / qwen2:7b
-    command: ["streamlit","run","src/web/app.py","--server.port=8501","--server.address=0.0.0.0"]
+    command: ["streamlit","run","src/ui/web/app.py","--server.port=8501","--server.address=0.0.0.0"]
     # One bind for the entire repo: any new folder is auto-visible (/app/*)
     volumes:
       - .:/app
