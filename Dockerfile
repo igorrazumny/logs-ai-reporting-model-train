@@ -1,4 +1,4 @@
-# File: Dockerfile
+# File: Dockerfile  (minimal tweak)
 ARG BASE=cpu
 
 FROM python:3.11-slim AS base_cpu
@@ -10,21 +10,20 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1
 WORKDIR /app
 
+# + libpq + psql client (like your Dockerfile.cli)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git curl ca-certificates build-essential pkg-config && \
+    git curl ca-certificates build-essential pkg-config \
+    libpq-dev postgresql-client && \
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install -r requirements.txt
 
-# project code
 COPY src/ ./src/
 COPY adapters/ ./adapters/
 COPY docs/ ./docs/
+COPY db/ ./db/
 COPY README.md LICENSE.txt ./
+ENV PYTHONPATH=/app/src:/app:/app/db
 
-# src/ layout
-ENV PYTHONPATH=/app/src
-
-# default command (so compose/run can override cleanly)
 CMD ["python","-m","src.logs_train.cli","help"]

@@ -1,4 +1,5 @@
-// File: drive_month_xlsx_only_shared_drive.gs
+// File: parsing_csv2xlsx.gs
+// Google AppScript which parses all CSV files from specific GDrive to .xlsx
 // Parse one month per run; EXPORT XLSX ONLY; Shared Drive compatible.
 // v1: single-file runner kept for backward-compat.
 // v2: folder-wide runner with unprocessed-line sink + live logging.

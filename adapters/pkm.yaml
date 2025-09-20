@@ -1,4 +1,0 @@
-# adapters/pkm show-save DB files source data.yaml
-app: pkm
-fields: [user, id, subseq_id, message, audit_utc, action, type, label, version]
-delimiter: "|"

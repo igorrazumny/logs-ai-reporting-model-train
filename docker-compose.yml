@@ -1,4 +1,4 @@
-# File: docker-compose.yml
+# File: logs-ai-reporting-model-train/docker-compose.yml
 
 services:
   ollama:
@@ -6,7 +6,7 @@ services:
     container_name: ollama
     restart: unless-stopped
     ports:
-      - "11434:11434"           # Ollama API (internal+external for now)
+      - "11434:11434"
     volumes:
       - ollama:/root/.ollama
 
@@ -18,35 +18,41 @@ services:
     image: logs-train:cpu
     container_name: logs-train
     restart: unless-stopped
-    env_file: .env
     environment:
       - PYTHONUNBUFFERED=1
-
-      # Log ingestion LLM (host+model from .env)
-      - LOG_LLM_HOST=${LOG_LLM_HOST}
-      - LOG_LLM_MODEL=${LOG_LLM_MODEL}
-
-      # NL→SQL LLM (host+model from .env; future use)
-      - SQL_LLM_HOST=${SQL_LLM_HOST}
-      - SQL_LLM_MODEL=${SQL_LLM_MODEL}
-
-      # Loader tuning
-      - LOAD_VERBOSE=1
-      - LOAD_TICK_SEC=1
-      - LOAD_PROGRESS_EVERY=500
-
-      # Streamlit default port
       - STREAMLIT_PORT=8501
+      - DB_HOST=db
+      - DB_PORT=5432
+      - POSTGRES_USER=logsai_user
+      - POSTGRES_PASSWORD=logsai_user_password
+      - POSTGRES_DB=logsaidb
+      - ADMIN_TOKEN=admin
+    command: ["streamlit","run","src/web/app.py","--server.port=8501","--server.address=0.0.0.0"]
     volumes:
       - ./src:/app/src
+      - ./db:/app/db
       - ./data:/app/data
       - ./outputs:/app/outputs
       - ./adapters:/app/adapters
       - ./docs:/app/docs
     ports:
-      - "8501:8501"             # Streamlit UI (reserved; becomes active once UI is added)
+      - "8501:8501"
     depends_on:
       - ollama
+      - db
+
+  db:
+    image: postgres:15
+    restart: always
+    environment:
+      POSTGRES_USER: logsai_user
+      POSTGRES_PASSWORD: logsai_user_password
+      POSTGRES_DB: logsaidb
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
 
 volumes:
   ollama:
+  pgdata:

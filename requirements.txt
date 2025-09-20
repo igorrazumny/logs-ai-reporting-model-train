@@ -1,8 +1,8 @@
-# File: requirements.txt
-duckdb==1.1.2
+# Project: logs-ai-reporting-model-train — File: requirements.txt
 pandas==2.2.2
 pyarrow==17.0.0
 python-dateutil==2.9.0.post0
 PyYAML==6.0.2
 streamlit==1.37.1
 requests==2.32.3
+psycopg[binary]==3.2.3
