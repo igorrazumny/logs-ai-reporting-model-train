@@ -11,7 +11,6 @@ services:
     restart: unless-stopped
     environment:
       - PYTHONUNBUFFERED=1
-
       # --- Postgres connection (app -> db) ---
       - DB_HOST=db
       - DB_PORT=5432
@@ -47,8 +46,6 @@ services:
       POSTGRES_USER: logsai_user
       POSTGRES_PASSWORD: logsai_user_password
       POSTGRES_DB: logsaidb
-    ports:
-      - "5433:5432"  # host:container
     volumes:
       - pgdata:/var/lib/postgresql/data:rw
 
