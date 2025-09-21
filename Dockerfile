@@ -22,6 +22,7 @@ RUN pip install -r requirements.txt
 # Code only — do not COPY empty data dirs; they are mounted at runtime.
 COPY src/ ./src/
 COPY docs/ ./docs/
+COPY prompts/ ./prompts/
 COPY README.md LICENSE.txt ./
 
 # If you later add non-empty runtime resources under ./adapters/, COPY it back.
