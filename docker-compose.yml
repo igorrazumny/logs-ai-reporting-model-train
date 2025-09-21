@@ -32,6 +32,11 @@ services:
       - LLM_MODEL=gemini-1.5-pro
       - GEMINI_STUDIO_API_KEY=${GEMINI_STUDIO_API_KEY}
 
+#      - LLM_PROVIDER=ollama
+#      - LLM_MODEL=llama3:8b   # or mistral:7b, mixtral:8x7b, etc.
+#      - OLLAMA_HOST=http://ollama:11434
+
+
     command: ["streamlit","run","src/ui/web/app.py","--server.port=8501","--server.address=0.0.0.0"]
 
     # Bind the whole repo so any new folder is visible at /app/*

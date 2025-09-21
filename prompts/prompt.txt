@@ -58,6 +58,7 @@ CRITICAL RULES (FOR YOUR INTERNAL SQL)
 - When the user specifies a date window, add audit_time BETWEEN ... AND ... (TIMESTAMPTZ) using inclusive start (>=) and exclusive end (< next day/month).
 - Date windows: interpret “in YEAR” as audit_time >= 'YEAR-01-01'::timestamptz AND < 'YEAR+1-01-01'::timestamptz.
 - Quarters: Q1 = Jan–Mar, Q2 = Apr–Jun, Q3 = Jul–Sep, Q4 = Oct–Dec; use inclusive start and exclusive end, e.g., Q4 2024 → audit_time >= '2024-10-01' AND < '2025-01-01'.
+- When the user says “show all …”, you must output the complete list of every row in sql_result with no summary phrases. Do not write lines like “(and N more)” or “the dataset contains …”. If the list is long, still list every row.
 
 EXAMPLES (few-shot demonstrations)
 

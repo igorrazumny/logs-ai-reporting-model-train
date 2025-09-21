@@ -4,6 +4,6 @@ EXAMPLES_MD = (
     "and summarize what I find.\n\n"
     "**You can ask such questions as:**\n"
     "- How many recipes we have?\n"
-    "- Show all General Recipies\n"
-    "- How much time we spent on Trastuzumab recipes.\n"
+    "- Show all General Recipies.\n"
+    "- How much time we spent on <recipe_name> recipes.\n"
 )
