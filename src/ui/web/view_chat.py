@@ -15,9 +15,38 @@ from ui.web.examples import EXAMPLES_MD
 
 PROMPT_PATH = "prompts/prompt.txt"  # system instruction file for the small LLM
 
+
 def _read_file(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
+
+
+def _build_recent_context(history, n: int = 3, max_chars: int = 300) -> str:
+    """
+    Build a compact conversational context from the last n turns.
+    Include user question and assistant answer, trimmed to max_chars total.
+    """
+    if not history:
+        return ""
+    turns = history[-n:]
+    bullets, total = [], 0
+    for t in turns:
+        u = (t.get("user") or "").strip()
+        a = (t.get("answer") or "").strip()
+        if u:
+            s = f"- User: {u}"
+            if total + len(s) + 1 > max_chars:
+                break
+            bullets.append(s)
+            total += len(s) + 1
+        if a:
+            s = f"- Answer: {a}"
+            if total + len(s) + 1 > max_chars:
+                break
+            bullets.append(s)
+            total += len(s) + 1
+    return ("Recent context:\n" + "\n".join(bullets)) if bullets else ""
+
 
 def view_chat() -> None:
     inject_chat_css()
@@ -66,23 +95,33 @@ def view_chat() -> None:
 
     try:
         with st.spinner("Checking logs…"):
+            # Build a compact conversational context from recent turns
+            context_block = _build_recent_context(st.session_state.get("history", []), n=3, max_chars=300)
+
             # Phase A — NL → SQL
             try:
-                raw_a = call_llm(system_prompt, user_q)
+                phase_a_user = (
+                    (context_block + "\n\n") if context_block else ""
+                ) + f"User question:\n{user_q}"
+                raw_a = call_llm(system_prompt, phase_a_user)
                 sql_stmt = extract_sql(raw_a)
                 if not sql_stmt:
                     ans = "I couldn't interpret that request. Please rephrase or be more specific."
                     st.markdown(ans)
                     st.session_state["history"].append({"user": user_q, "answer": ans})
-                    log_sql_event(user_q, "", [], [], 0, error="empty SQL",
-                                  raw_a=raw_a, elapsed_total=time.perf_counter() - t0)
+                    log_sql_event(
+                        user_q, "", [], [], 0, error="empty SQL",
+                        raw_a=raw_a, elapsed_total=time.perf_counter() - t0
+                    )
                     return
             except Exception as e:
                 ans = "I couldn't generate a query for that request. Please try rephrasing."
                 st.markdown(ans)
                 st.session_state["history"].append({"user": user_q, "answer": ans})
-                log_sql_event(user_q, "", [], [], 0, error=f"LLM generation error: {e}",
-                              raw_a=raw_a, elapsed_total=time.perf_counter() - t0)
+                log_sql_event(
+                    user_q, "", [], [], 0, error=f"LLM generation error: {e}",
+                    raw_a=raw_a, elapsed_total=time.perf_counter() - t0
+                )
                 return
 
             # Phase DB — execute SQL (statement timeout handled inside exec_sql)
@@ -92,25 +131,33 @@ def view_chat() -> None:
                 ans = "I couldn’t find an answer for this request. Please try rephrasing."
                 st.markdown(ans)
                 st.session_state["history"].append({"user": user_q, "answer": ans})
-                log_sql_event(user_q, sql_stmt, [], [], 0, error=str(e),
-                              raw_a=raw_a, elapsed_total=time.perf_counter() - t0)
+                log_sql_event(
+                    user_q, sql_stmt, [], [], 0, error=str(e),
+                    raw_a=raw_a, elapsed_total=time.perf_counter() - t0
+                )
                 return
 
             if not rows:
                 ans = "No matching records found in the logs for this request."
                 st.markdown(ans)
                 st.session_state["history"].append({"user": user_q, "answer": ans})
-                log_sql_event(user_q, sql_stmt, cols, [], 0,
-                              raw_a=raw_a, elapsed_total=time.perf_counter() - t0)
+                log_sql_event(
+                    user_q, sql_stmt, cols, [], 0,
+                    raw_a=raw_a, elapsed_total=time.perf_counter() - t0
+                )
                 return
 
-            # Phase B — summarize to natural text only
-            MAX_ROWS_TO_SEND = 200
-            payload_rows = rows[:MAX_ROWS_TO_SEND]
-            sql_result = {"columns": cols, "rows": payload_rows, "total_rows": len(rows)}
+            # Phase B — summarize to natural text only (send ALL rows; no caps)
+            sql_result = {
+                "columns": cols,
+                "rows": rows,                 # <-- send full result set
+                "total_rows": len(rows)
+            }
             phase_b_input = (
                 system_prompt
-                + "\n\nUser question:\n" + user_q
+                + "\n\n"
+                + ((context_block + "\n\n") if context_block else "")
+                + "User question:\n" + user_q
                 + "\n\nsql_result (JSON):\n" + json.dumps(sql_result, ensure_ascii=False)
                 + "\n\nReturn only a short natural-language answer (no code fences, no SQL)."
             )
@@ -132,5 +179,7 @@ def view_chat() -> None:
     st.caption(f"Thought for {fmt_elapsed(time.perf_counter()-t0)}")
 
     st.session_state["history"].append({"user": user_q, "answer": answer_text})
-    log_sql_event(user_q, sql_stmt, cols, rows[:20], len(rows),
-                  raw_a=raw_a, raw_b=raw_b, elapsed_total=time.perf_counter() - t0)
+    log_sql_event(
+        user_q, sql_stmt, cols, rows[:20], len(rows),   # logging may still sample; does not affect UI
+        raw_a=raw_a, raw_b=raw_b, elapsed_total=time.perf_counter() - t0
+    )

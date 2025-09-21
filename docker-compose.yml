@@ -1,15 +1,6 @@
 # File: logs-ai-reporting-model-train/docker-compose.yml
 
 services:
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    restart: unless-stopped
-    ports:
-      - "11434:11434"
-    volumes:
-      - ollama:/root/.ollama
-
   app:
     build:
       context: .
@@ -21,25 +12,32 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - STREAMLIT_PORT=8501
+
+      # --- Postgres ---
       - DB_HOST=db
       - DB_PORT=5432
       - POSTGRES_USER=logsai_user
       - POSTGRES_PASSWORD=logsai_user_password
       - POSTGRES_DB=logsaidb
+
+      # --- App auth ---
       - ADMIN_TOKEN=admin
-      - LLM_PROVIDER=gemini
-      - LLM_MODEL=gemini-1.5-pro
-      - GEMINI_STUDIO_API_KEY=${GEMINI_STUDIO_API_KEY}
-#      - LLM_HOST=http://ollama:11434
-#      - LLM_MODEL=llama3:8b     # other options: mixtral:8x7b / llama3:8b / mistral:7b / gemma:7b / qwen2:7b
+
+      # --- LLM: OpenAI GPT-5 ---
+      - LLM_PROVIDER=openai
+      - LLM_MODEL=gpt-4o
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+
     command: ["streamlit","run","src/ui/web/app.py","--server.port=8501","--server.address=0.0.0.0"]
-    # One bind for the entire repo: any new folder is auto-visible (/app/*)
+
+    # Bind the whole repo so any new folder is visible at /app/*
     volumes:
       - .:/app
+
     ports:
       - "8501:8501"
+
     depends_on:
-      - ollama
       - db
 
   db:
@@ -55,5 +53,4 @@ services:
       - pgdata:/var/lib/postgresql/data
 
 volumes:
-  ollama:
   pgdata:
