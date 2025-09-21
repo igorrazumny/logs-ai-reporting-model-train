@@ -2,26 +2,32 @@
 import os
 import requests
 
+from config.keys import (
+    GEMINI_1_5_PRO,
+    GEMINI_1_5_FLASH,
+    ENV_GEMINI_STUDIO_API_KEY,
+)
+
 """
-Strict LLM adapter with exactly two supported backends — no silent defaults.
+Strict adapter with exactly two explicit providers. No silent defaults.
 
-Required environment variables:
+Configuration (must be set explicitly):
 
-# Select backend explicitly
-LLM_PROVIDER                # 'gemini' | 'ollama' (no default; must be set)
+# Select provider
+LLM_PROVIDER                # 'gemini' | 'ollama'  (required)
 
-# If LLM_PROVIDER=gemini (Gemini 1.5 Pro via Gemini API / Studio)
-LLM_MODEL                   # e.g. 'gemini-1.5-pro' (must be set; no fallback)
-LLM_API_KEY                 # Gemini API key
+# If LLM_PROVIDER=gemini (Gemini 1.5 via Google AI Studio API)
+GEMINI_STUDIO_API_KEY       # Studio API key (required)
+LLM_MODEL                   # 'gemini-1.5-pro' | 'gemini-1.5-flash' (required; no fallback)
 
 # If LLM_PROVIDER=ollama (local dev/fallback)
-LLM_HOST                    # e.g. 'http://ollama:11434'
-LLM_MODEL                   # e.g. 'llama3:8b'
+OLLAMA_HOST                 # e.g. 'http://ollama:11434' (required)
+LLM_MODEL                   # e.g. 'llama3:8b', 'mistral:7b' (required)
 
 Notes:
-- temperature is fixed at 0 for SQL stability
-- timeout is enforced by the caller (default 300s)
-- no defaults or fallbacks are applied; missing/invalid envs raise immediately
+- Temperature fixed at 0 for stable SQL generation.
+- The caller enforces a 300s timeout (override via timeout_s if needed).
+- Any missing/invalid configuration raises immediately with a clear message.
 """
 
 def _req(name: str) -> str:
@@ -31,13 +37,22 @@ def _req(name: str) -> str:
         raise RuntimeError(f"Missing required environment variable: {name}")
     return val
 
-def call_llm(system_prompt: str, user_query: str, timeout_s: int = 300) -> str:
-    provider = _req("LLM_PROVIDER").lower()
+def _is_allowed_gemini_id(model_id: str) -> bool:
+    mid = (model_id or "").strip().lower()
+    return mid in {GEMINI_1_5_PRO, GEMINI_1_5_FLASH}
 
-    # ---------------- Gemini 1.5 Pro (Gemini API / Studio) ----------------
+def call_llm(system_prompt: str, user_query: str, timeout_s: int = 300) -> str:
+    provider = _req("LLM_PROVIDER").strip().lower()
+
+    # ---------------- Gemini 1.5 (Google AI Studio API) ----------------
     if provider == "gemini":
-        model = _req("LLM_MODEL")          # e.g. 'gemini-1.5-pro'
-        api_key = _req("LLM_API_KEY")
+        api_key = _req(ENV_GEMINI_STUDIO_API_KEY)
+        model_id = _req("LLM_MODEL").strip()
+        if not _is_allowed_gemini_id(model_id):
+            raise RuntimeError(
+                f"Unsupported LLM_MODEL='{model_id}' for Gemini. "
+                f"Allowed: '{GEMINI_1_5_PRO}', '{GEMINI_1_5_FLASH}'."
+            )
 
         try:
             import google.generativeai as genai
@@ -48,18 +63,18 @@ def call_llm(system_prompt: str, user_query: str, timeout_s: int = 300) -> str:
             ) from e
 
         genai.configure(api_key=api_key)
-        model_obj = genai.GenerativeModel(model_name=model, system_instruction=system_prompt)
-        resp = model_obj.generate_content(
+        model = genai.GenerativeModel(model_name=model_id, system_instruction=system_prompt)
+        resp = model.generate_content(
             user_query,
             generation_config={"temperature": 0, "max_output_tokens": 1024},
-            safety_settings=None,
+            safety_settings=None,  # use provider defaults
         )
         return (resp.text or "").strip()
 
-    # ---------------- Local Ollama (dev/fallback) ----------------
+    # ---------------- Ollama (local dev / fallback) ----------------
     if provider == "ollama":
-        host  = _req("LLM_HOST")           # e.g. 'http://ollama:11434'
-        model = _req("LLM_MODEL")          # e.g. 'llama3:8b'
+        host  = _req("OLLAMA_HOST")          # e.g. 'http://ollama:11434'
+        model = _req("LLM_MODEL")            # e.g. 'llama3:8b', 'mistral:7b'
 
         body = {
             "model": model,
