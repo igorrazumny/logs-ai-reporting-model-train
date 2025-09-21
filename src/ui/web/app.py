@@ -10,6 +10,12 @@ ADMIN_QUERY_KEY = "admin"  # routing only
 
 def main() -> None:
     qp = getattr(st, "query_params", None)
+
+    st.set_page_config(
+        page_title="BCCA Logs AI Reporting Solution",
+        page_icon="📊",  # clean AI assistant vibe
+    )
+
     if qp is None:
         params = st.experimental_get_query_params()
         admin_param = (params.get(ADMIN_QUERY_KEY, [None]) or [None])[0]
