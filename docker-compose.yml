@@ -1,4 +1,5 @@
-# File: logs-ai-reporting-model-train/docker-compose.yml
+# Project: logs-ai-reporting-model-train — File: docker-compose.yml
+version: "3.9"
 
 services:
   app:
@@ -13,7 +14,7 @@ services:
       - PYTHONUNBUFFERED=1
       - STREAMLIT_PORT=8501
 
-      # --- Postgres ---
+      # --- Postgres connection (app -> db) ---
       - DB_HOST=db
       - DB_PORT=5432
       - POSTGRES_USER=logsai_user
@@ -23,43 +24,37 @@ services:
       # --- App auth ---
       - ADMIN_TOKEN=admin
 
-      # --- LLM ---
-#      - LLM_PROVIDER=openai
-#      - LLM_MODEL=gpt-4o
-#      - OPENAI_API_KEY=${OPENAI_API_KEY}
-
+      # --- LLM (current) ---
       - LLM_PROVIDER=gemini
       - LLM_MODEL=gemini-1.5-pro
       - GEMINI_STUDIO_API_KEY=${GEMINI_STUDIO_API_KEY}
 
-#      - LLM_PROVIDER=ollama
-#      - LLM_MODEL=llama3:8b   # or mistral:7b, mixtral:8x7b, etc.
-#      - OLLAMA_HOST=http://ollama:11434
-
-
     command: ["streamlit","run","src/ui/web/app.py","--server.port=8501","--server.address=0.0.0.0"]
 
-    # Bind the whole repo so any new folder is visible at /app/*
+    # Persist only what matters; host paths are intentionally unspecified.
     volumes:
-      - .:/app
+      - data:/app/data:rw
+      - outputs:/app/outputs:rw
 
     ports:
       - "8501:8501"
-
     depends_on:
       - db
 
   db:
     image: postgres:15
+    container_name: logs-train-db
     restart: always
     environment:
       POSTGRES_USER: logsai_user
       POSTGRES_PASSWORD: logsai_user_password
       POSTGRES_DB: logsaidb
     ports:
-      - "5433:5432"
+      - "5433:5432"  # host:container
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql/data:rw
 
 volumes:
+  data:
+  outputs:
   pgdata:

@@ -19,7 +19,6 @@ venv/
 
 # Data & models (proprietary artifacts)
 data/
-datasets/
 models/
 outputs/
 checkpoints/
@@ -34,8 +33,6 @@ artifacts/
 .vscode/
 
 # Local data and outputs
-data/
-outputs/
 *.csv
 *.parquet
 *.duckdb
