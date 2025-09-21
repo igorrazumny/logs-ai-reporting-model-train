@@ -3,7 +3,7 @@ EXAMPLES_MD = (
     "I help you explore **BCCA logs**. Ask questions and I’ll check the logs "
     "and summarize what I find.\n\n"
     "**You can ask such questions as:**\n"
-    "- How many recipes we have?\n"
-    "- Show all General Recipies.\n"
-    "- How much time we spent on <recipe_name> recipes.\n"
+    "- How many GRs we have?\n"
+    "- Show all SRs.\n"
+    "- How much time we spent on <recipe_name>.\n"
 )
