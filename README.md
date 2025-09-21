@@ -1,20 +1,13 @@
-# logs-ai-reporting-model-train
+<!-- Project: logs-ai-reporting — File: README.md -->
 
-Private repository for training domain-specific language models used in the
-RazumAI logs reporting solution.
+# logs-ai-reporting
 
-## Contents
-- `scripts/` — anonymizer, label generator, LoRA/QLoRA training, evaluation harness.
-- `data/` — local staging for anonymized logs (ignored in git).
-- `models/` — trained adapters, checkpoints, and model cards (ignored in git).
-- `outputs/` — reports, logs, and evaluation artifacts (ignored in git).
+AI logs reporting solution.
 
-## Important
-- This repository is **confidential and proprietary**.  
-- See `LICENSE.txt` for permitted usage.  
-- No code, data, or model artifacts here are open source.
+## Persistent volumes
+- `/app/data` — input data  
+- `/app/outputs` — generated reports/logs  
+- `/var/lib/postgresql/data` — Postgres cluster  
 
-## Related Projects
-- [logs-ai-reporting-runtime](https://github.com/igorrazumny/logs-ai-reporting-runtime)  
-  Public-facing runtime / DevOps repository.
-
+## Required environment variable
+- `GEMINI_STUDIO_API_KEY` — Gemini Studio key for LLM access
