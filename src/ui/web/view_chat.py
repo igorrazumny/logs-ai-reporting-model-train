@@ -68,7 +68,7 @@ def _jsonify_rows(rows):
 def view_chat() -> None:
     inject_chat_css()
 
-    st.title("BCCA Logs AI Reporting Solution")
+    st.title("BCCA Logs AI Reporting")
     st.markdown(EXAMPLES_MD)
 
     # Load the system prompt once

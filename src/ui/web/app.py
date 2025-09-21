@@ -1,28 +1,25 @@
-# Project: logs-ai-reporting-model-train — File: src/web/app.py
-import os
+# Project: logs-ai-reporting-model-train — File: src/ui/web/app.py
 import streamlit as st
-
-# Route: Admin by token => Admin UI; else Chat
 from ui.admin.app_admin import render_admin
-from ui.web.view_chat import view_chat  # <- all chat logic moved here
+from ui.web.view_chat import view_chat  # adjust if your chat view lives elsewhere
 
-ADMIN_QUERY_KEY = "admin"  # routing only
+# --- MUST be first Streamlit call on the page ---
+def _is_admin_mode() -> bool:
+    try:
+        params = st.query_params
+    except Exception:
+        params = st.experimental_get_query_params()
+    v = params.get("admin")
+    return v in ("admin", ["admin"], "true", ["true"], True)
+
+ADMIN = _is_admin_mode()
+PAGE_TITLE = "[ADMIN] BCCA Logs AI Reporting" if ADMIN else "BCCA Logs AI Reporting"
+PAGE_ICON = "📊"
+
+st.set_page_config(page_title=PAGE_TITLE, page_icon=PAGE_ICON)
 
 def main() -> None:
-    qp = getattr(st, "query_params", None)
-
-    st.set_page_config(
-        page_title="BCCA Logs AI Reporting Solution",
-        page_icon="📊",  # clean AI assistant vibe
-    )
-
-    if qp is None:
-        params = st.experimental_get_query_params()
-        admin_param = (params.get(ADMIN_QUERY_KEY, [None]) or [None])[0]
-    else:
-        admin_param = qp.get(ADMIN_QUERY_KEY, None)
-
-    if admin_param and admin_param == os.getenv("ADMIN_TOKEN"):
+    if ADMIN:
         render_admin()
     else:
         view_chat()

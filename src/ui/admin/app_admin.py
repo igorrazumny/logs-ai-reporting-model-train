@@ -10,7 +10,7 @@ from db.init_db import main as init_db_main
 from db.connection import get_connection
 from db.ingest.xlsx2db import list_staged_xlsx, ingest_file
 
-UPLOAD_DIR = "/app/data/uploads"  # bind mount
+UPLOAD_DIR = "/app/data/uploads"
 
 def _reset_database() -> None:
     try:
@@ -21,7 +21,9 @@ def _reset_database() -> None:
                 cur.execute("GRANT ALL ON SCHEMA public TO logsai_user;")
             conn.commit()
         rc = init_db_main()
-        st.success("Database reset: schema dropped and reapplied.") if rc == 0 else \
+        if rc == 0:
+            st.success("Database reset: schema dropped and reapplied.")
+        else:
             st.error(f"Schema re-apply failed (exit {rc}). See container logs.")
     except Exception as e:
         st.error(f"Reset failed: {e}")
@@ -39,7 +41,6 @@ def _clear_staged_files() -> None:
                 except Exception:
                     pass
         st.success(f"Cleared {cnt} staged file(s) from {UPLOAD_DIR}")
-        # Reset the uploader widget (clears client-side selected filenames)
         st.session_state["uploader_key"] += 1
         st.rerun()
     except Exception as e:
@@ -47,14 +48,12 @@ def _clear_staged_files() -> None:
         st.code(traceback.format_exc())
 
 def render_admin() -> None:
-    st.title("Logs AI — Admin")
+    st.title("[ADMIN] BCCA Logs AI Reporting")
     st.caption("DB controls and file staging")
 
-    # ---- resettable uploader key (so Clear staged files also clears selection)
     if "uploader_key" not in st.session_state:
         st.session_state["uploader_key"] = 0
 
-    # --- 1) Database controls ---
     st.subheader("1) Database")
     c1, c2 = st.columns(2)
     with c1:
@@ -64,11 +63,9 @@ def render_admin() -> None:
         if st.button("Clear staged files"):
             _clear_staged_files()
 
-    # Always reflect actual disk state
     staged = list_staged_xlsx()
     st.caption(f"Currently staged: {len(staged)} file(s) in {UPLOAD_DIR}")
 
-    # --- 2) Stage files (XLSX / ZIP) ---
     st.subheader("2) Stage files (XLSX / ZIP)")
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     uploaded = st.file_uploader(
@@ -76,7 +73,7 @@ def render_admin() -> None:
         type=["xlsx", "zip"],
         accept_multiple_files=True,
         help=f"Files are saved to {UPLOAD_DIR}. Use the button below to upload them into the DB.",
-        key=f"uploader_{st.session_state['uploader_key']}",  # <- makes widget resettable
+        key=f"uploader_{st.session_state['uploader_key']}",
     )
 
     if uploaded:
@@ -111,7 +108,7 @@ def render_admin() -> None:
 
         if saved:
             st.success(f"Staged {len(saved)} file(s).")
-            staged = list_staged_xlsx()  # refresh list from disk
+            staged = list_staged_xlsx()
 
         if errors:
             st.error("Some files failed:")
@@ -120,7 +117,6 @@ def render_admin() -> None:
     if staged:
         st.code("\n".join(staged))
 
-    # --- 3) Upload to DB (stream per-file progress) ---
     st.subheader("3) Upload to DB")
     upload_disabled = (len(staged) == 0)
     if st.button("Upload staged files to DB", disabled=upload_disabled):
