@@ -3,6 +3,8 @@ import json
 import time
 import threading
 import streamlit as st
+from decimal import Decimal
+from datetime import datetime, date
 
 from llm.adapter import call_llm
 from nl_sql.utils import (
@@ -46,6 +48,20 @@ def _build_recent_context(history, n: int = 3, max_chars: int = 300) -> str:
             bullets.append(s)
             total += len(s) + 1
     return ("Recent context:\n" + "\n".join(bullets)) if bullets else ""
+
+
+def _jsonify_rows(rows):
+    """Coerce DB row values to JSON-serializable types for Phase B payloads."""
+    def coerce(v):
+        if isinstance(v, Decimal):
+            try:
+                return float(v)
+            except Exception:
+                return str(v)
+        if isinstance(v, (datetime, date)):
+            return v.isoformat()
+        return v
+    return [[coerce(v) for v in r] for r in rows]
 
 
 def view_chat() -> None:
@@ -147,10 +163,10 @@ def view_chat() -> None:
                 )
                 return
 
-            # Phase B — summarize to natural text only (send ALL rows; no caps)
+            # Phase B — summarize to natural text only (send ALL rows; JSON-safe)
             sql_result = {
                 "columns": cols,
-                "rows": rows,                 # <-- send full result set
+                "rows": _jsonify_rows(rows),
                 "total_rows": len(rows)
             }
             phase_b_input = (
@@ -180,6 +196,6 @@ def view_chat() -> None:
 
     st.session_state["history"].append({"user": user_q, "answer": answer_text})
     log_sql_event(
-        user_q, sql_stmt, cols, rows[:20], len(rows),   # logging may still sample; does not affect UI
+        user_q, sql_stmt, cols, rows[:20], len(rows),
         raw_a=raw_a, raw_b=raw_b, elapsed_total=time.perf_counter() - t0
     )

@@ -23,10 +23,14 @@ services:
       # --- App auth ---
       - ADMIN_TOKEN=admin
 
-      # --- LLM: OpenAI GPT-5 ---
-      - LLM_PROVIDER=openai
-      - LLM_MODEL=gpt-4o
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      # --- LLM ---
+#      - LLM_PROVIDER=openai
+#      - LLM_MODEL=gpt-4o
+#      - OPENAI_API_KEY=${OPENAI_API_KEY}
+
+      - LLM_PROVIDER=gemini
+      - LLM_MODEL=gemini-1.5-pro
+      - GEMINI_STUDIO_API_KEY=${GEMINI_STUDIO_API_KEY}
 
     command: ["streamlit","run","src/ui/web/app.py","--server.port=8501","--server.address=0.0.0.0"]
 

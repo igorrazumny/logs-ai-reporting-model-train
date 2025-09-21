@@ -6,5 +6,4 @@ EXAMPLES_MD = (
     "- How many recipes we have?\n"
     "- Show all General Recipies\n"
     "- How much time we spent on Trastuzumab recipes.\n"
-    "- Total time on 'Tocilizumab' between 2025-07-01 and 2025-09-30.\n"
 )
