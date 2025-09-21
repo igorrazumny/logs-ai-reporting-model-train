@@ -26,7 +26,6 @@ psql:
 
 # Show row statistics per user table.
 show-db-stats:
-show-db-stats:
 	docker compose exec db psql -U logsai_user -d logsaidb -c "\
 		SELECT relname AS table, n_live_tup AS estimated_rows \
 		FROM pg_stat_user_tables \
