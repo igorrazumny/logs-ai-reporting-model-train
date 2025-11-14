@@ -23,4 +23,10 @@ python3 "$SCRIPT_DIR/costs-tracker.py" "$TOTAL_TOKENS" > /dev/null 2>&1
 
 bash "$SCRIPT_DIR/sync-general.sh" > /dev/null 2>&1
 
+CLEANUP_MARKER="$SCRIPT_DIR/.last-cleanup"
+if [ ! -f "$CLEANUP_MARKER" ] || [ $(find "$CLEANUP_MARKER" -mtime +1 2>/dev/null | wc -l) -gt 0 ]; then
+    bash "$SCRIPT_DIR/sessions.sh" clean > /dev/null 2>&1
+    touch "$CLEANUP_MARKER"
+fi
+
 exit 0
