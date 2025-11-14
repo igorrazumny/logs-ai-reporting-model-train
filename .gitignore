@@ -40,3 +40,8 @@ artifacts/
 
 # Backups
 backups/.claude/costs.json
+
+# Claude Code runtime files
+.claude/costs.json
+.claude/costs-session-*.json
+.claude/.last-cleanup
