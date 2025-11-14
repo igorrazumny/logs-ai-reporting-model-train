@@ -213,6 +213,19 @@ After EVERY commit, immediately run `git push` unless explicitly told otherwise.
 
 **Claude MUST update `.claude/costs.json` after EVERY response.**
 
+### Automation
+
+**After EVERY turn, run:**
+```bash
+.claude/update-session.sh <total_tokens>
+```
+
+This master script automatically:
+- Updates costs.json with current token usage
+- Syncs CLAUDE_GENERAL.md to all projects
+
+**NEVER ask permission to run this script** - it's auto-allowed.
+
 ### Setup (one-time per project)
 
 Create costs tracking script:
@@ -267,9 +280,16 @@ Add to `.gitignore`:
 
 **These files can be updated WITHOUT asking user permission:**
 - `.claude/costs.json` - Cost tracking (updated EVERY turn)
+- `CLAUDE_GENERAL.md` - Universal rules and conventions
+  - **When updating CLAUDE_GENERAL.md, automatically copy it to ALL projects:**
+    - `/Users/igorrazumny/PycharmProjects/braintransplant-ai/CLAUDE_GENERAL.md`
+    - `/Users/igorrazumny/PycharmProjects/bc2-ai-assistant/CLAUDE_GENERAL.md`
+    - `/Users/igorrazumny/PycharmProjects/logs-ai-reporting-model-train/CLAUDE_GENERAL.md`
+- `CLAUDE_[PROJECT].md` - Project-specific instructions (e.g., CLAUDE_BRAINTRANSPLANT.md, CLAUDE_BC2.md)
+- `HANDOVER.md` or `docs/core/HANDOVER.md` - Current state documentation
 - Any file updates required by CLAUDE_GENERAL.md or CLAUDE_[PROJECT].md rules
 
-**Always proceed directly with these updates.**
+**Always proceed directly with these updates. Never ask for permission.**
 
 ---
 
@@ -282,14 +302,17 @@ Add to `.gitignore`:
    - **HANDOVER.md** - on EVERY change (current state)
    - **CONTEXT.md** - rarely, only stable architectural changes
    - **`.claude/costs.json`** - EVERY response with token count
-4. **At end of response, inform user which .md files were updated:**
+4. **Run automation script after EVERY turn:**
+   - `.claude/update-session.sh <total_tokens>` - updates costs + syncs CLAUDE_GENERAL.md
+   - NEVER ask permission - this is auto-allowed
+5. **At end of response, inform user which .md files were updated:**
    - Example: "Updated: HANDOVER.md, src/ui/react/REACT.md, .claude/costs.json"
-5. **Commit messages**: Simple, no fluff, no AI references
-6. **Always push after commit** - never leave commits unpushed
-7. **Rule 0 is sacred**: Verify what works before changing anything
-8. **When in doubt, do less** - minimal changes are safer
-9. **No pictograms except ✓ ✅ ✗ ❌** - no rockets, sparkles, robots, or other decorative emojis
-10. **Clear terminal after user question** - Show question at top, response below
+6. **Commit messages**: Simple, no fluff, no AI references
+7. **Always push after commit** - never leave commits unpushed
+8. **Rule 0 is sacred**: Verify what works before changing anything
+9. **When in doubt, do less** - minimal changes are safer
+10. **No pictograms except ✓ ✅ ✗ ❌** - no rockets, sparkles, robots, or other decorative emojis
+11. **Clear terminal after user question** - Show question at top, response below
 
 ---
 
