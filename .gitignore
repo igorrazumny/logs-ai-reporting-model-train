@@ -39,4 +39,4 @@ artifacts/
 
 
 # Backups
-backups/
+backups/.claude/costs.json
